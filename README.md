@@ -211,3 +211,9 @@ A running process with no model requests does no work and consumes no quota. Con
 **Text only.** Images, voice messages and documents are ignored.
 
 **Many chats at once is not worked out.** See the TODO at the top of the file: every active chat holds its own process, with no eviction of inactive ones. It works fine with 3–5 chats; beyond that it needs a cap on concurrently running processes and overload handling.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
