@@ -76,6 +76,11 @@ def _parse_user_ids(raw: str) -> set:
 
 ALLOWED_USERS = _parse_user_ids(os.environ.get("ALLOWED_USERS", ""))
 
+# Повторно сообщать об отказе одному и тому же человеку в одном чате не чаще
+# этого. С выключенным privacy mode группа иначе получит отказ на каждое
+# сообщение каждого постороннего — бот сам станет спамером. 0 = отвечать всегда.
+DENY_NOTICE_COOLDOWN_S = float(os.environ.get("DENY_NOTICE_COOLDOWN_S", "600"))
+
 # База для относительных путей в /cd. Абсолютный путь и ~ идут мимо неё.
 PROJECT_BASE_DIR = os.environ.get("PROJECT_BASE_DIR", "") or CLAUDE_WORKDIR
 
@@ -1044,6 +1049,23 @@ HELP = (
 )
 
 
+_deny_notified: Dict[Tuple[int, int], float] = {}
+
+
+def _should_notify_denial(chat_id: int, user_id: Optional[int]) -> bool:
+    """Первый отказ проговариваем, повторы в пределах паузы — молча."""
+    if DENY_NOTICE_COOLDOWN_S <= 0:
+        return True
+    key = (chat_id, user_id or 0)
+    now = time.monotonic()
+    if now - _deny_notified.get(key, 0.0) < DENY_NOTICE_COOLDOWN_S:
+        return False
+    if len(_deny_notified) > 1000:      # не растим словарь бесконечно
+        _deny_notified.clear()
+    _deny_notified[key] = now
+    return True
+
+
 async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or msg.get("caption") or "").strip()
@@ -1054,14 +1076,19 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     if ALLOWED_USERS:
         user_id = (msg.get("from") or {}).get("id")
         if user_id not in ALLOWED_USERS:
-            if msg.get("chat", {}).get("type") == "private":
-                # Личка: отвечаем, чтобы человек мог назвать свой id владельцу.
-                log.warning("отказ: user_id=%s chat_id=%s", user_id, chat_id)
-                await tg.send(chat_id, f"Нет доступа.\nТвой user_id: {user_id}")
-            else:
-                # Группа: молчим. Иначе с выключенным privacy mode бот засыпет
-                # чат отказами на каждое сообщение любого участника.
-                log.debug("отказ в группе: user_id=%s chat_id=%s", user_id, chat_id)
+            # Отвечаем реплаем на само сообщение: в группе иначе непонятно,
+            # что именно проигнорировано. Повторы гасит пауза.
+            notify = _should_notify_denial(chat_id, user_id)
+            log.log(
+                logging.WARNING if notify else logging.DEBUG,
+                "отказ: user_id=%s chat_id=%s", user_id, chat_id,
+            )
+            if notify:
+                await tg.send(
+                    chat_id,
+                    f"Сообщение проигнорировано: нет доступа.\nuser_id: {user_id}",
+                    reply_to=msg.get("message_id"),
+                )
             return
 
     actor = sup.actor(chat_id)

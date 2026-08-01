@@ -113,7 +113,9 @@ ALLOWED_USERS=622492578,166090940
 
 The check is per user and applies in every chat, so adding the bot to a group grants nothing to the other members — each of them is checked individually. It runs before anything else, so a stranger never starts a process or spends quota.
 
-A rejected user gets a short reply with their own `user_id` in a private chat, so they can pass it on to be added. In groups the bot stays silent: with privacy mode off it would otherwise answer every message from every member.
+A rejected message gets a short refusal, sent as a reply to the message itself so it is clear in a group what was ignored. It carries the sender's own `user_id`, which they can pass on to be added.
+
+The same person is told again in the same chat no more often than `DENY_NOTICE_COOLDOWN_S` (10 minutes); further messages are dropped silently. Without that, a group with privacy mode off would get a refusal for every message from every non-listed member. The pause is tracked per chat and per person, so a second member still gets their own answer. `DENY_NOTICE_COOLDOWN_S=0` answers every time.
 
 Send `/start` to learn your own `user_id`. Entries that are not numbers are skipped with a warning at startup — a typo would otherwise lock you out quietly.
 
@@ -152,6 +154,7 @@ Cost is one extra model request. No separate request is spent on delivering the 
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | Required. Token from BotFather |
 | `ALLOWED_USERS` | empty | Comma-separated user IDs allowed to use the bot. Empty lets everyone in |
+| `DENY_NOTICE_COOLDOWN_S` | `600` | Pause before repeating the refusal to the same person in the same chat. `0` answers every time |
 | `CLAUDE_BIN` | `claude` | Path to the executable, if it is not on PATH |
 | `CLAUDE_MODEL` | `sonnet` | Model for new chats |
 | `CLAUDE_WORKDIR` | current directory | Default working directory for chats that have not used `/cd`. `--resume` is bound to the path: saved sessions are not found if the directory changes |
