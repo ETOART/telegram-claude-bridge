@@ -55,6 +55,14 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", os.getcwd())
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 
+# stream-json — построчный протокол: одно событие claude на одну строку stdout.
+# asyncio.StreamReader требует числовой лимit буфера (не умеет "без лимита") и
+# без него режет строку на 64 КиБ, роняя ход ("Separator is found, but chunk
+# is longer than limit"), если инструмент вернул много текста (большой файл,
+# длинный вывод команды). sys.maxsize — практически то же самое, что без
+# лимита: реального события такого размера не бывает раньше, чем кончится ОЗУ.
+STDOUT_LINE_LIMIT = int(os.environ.get("STDOUT_LINE_LIMIT", str(sys.maxsize)))
+
 # Белый список по user_id: пускаем конкретных людей в любом чате, а не чаты
 # целиком. Пусто = пускаем всех (поведение по умолчанию не меняется).
 # Мусорные значения не глотаем молча — о них предупреждаем при старте.
@@ -122,7 +130,7 @@ DEBOUNCE_S = float(os.environ.get("DEBOUNCE_S", "1.2"))
 IDLE_TIMEOUT_S = float(os.environ.get("IDLE_TIMEOUT_S", "900"))
 
 # Потолок на один ход. Дольше — считаем, что процесс завис.
-TURN_TIMEOUT_S = float(os.environ.get("TURN_TIMEOUT_S", "180"))
+TURN_TIMEOUT_S = float(os.environ.get("TURN_TIMEOUT_S", "600"))
 
 # После перезапуска скрипта возобновляем сессию только если пауза меньше этого.
 # Дольше — начинаем чисто: старый контекст всё равно раздут, а история диалога
@@ -151,13 +159,24 @@ CRASH_COOLDOWN_S = 600.0
 
 SYSTEM_APPEND = os.environ.get(
     "CLAUDE_SYSTEM_APPEND",
-    "Ты отвечаешь в Telegram. Пиши компактно, без markdown-заголовков и "
-    "таблиц — они не рендерятся. Списки и код допустимы. В групповых чатах "
-    "сообщения приходят с префиксом [Имя]: — это разные собеседники.",
+    "You're replying in Telegram, which renders a limited legacy-Markdown "
+    "subset: *bold*, _italic_, `inline code`, and ``` code blocks ``` work. "
+    "Headers (#), tables and nested formatting don't render — avoid those, "
+    "use a plain '-' for list items instead. Keep it compact. In group "
+    "chats, messages arrive prefixed with [Name]: — that's how you tell "
+    "people apart.",
 )
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 TG_MSG_LIMIT = 4000
+
+# Малозаметная метка перед каждым сообщением от самого бриджа (ошибки,
+# статусы, помощь), чтобы в чате было видно, что это не ответ Клода.
+SYS_TAG = "_SYSTEM_"
+
+
+def sys_text(body: str) -> str:
+    return f"{SYS_TAG} · {body}"
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -270,26 +289,26 @@ def resolve_workdir(raw: str) -> Tuple[Optional[str], str]:
     """
     p = raw.strip().strip('"').strip("'")
     if not p:
-        return None, "Пустой путь."
+        return None, "Empty path."
     try:
         path = pathlib.Path(p).expanduser()
         if not path.is_absolute():
             path = pathlib.Path(PROJECT_BASE_DIR).expanduser() / path
         path = path.resolve()
     except Exception as e:
-        return None, f"Не удалось разобрать путь: {e}"
+        return None, f"Couldn't parse path: {e}"
 
     if not path.exists():
-        return None, f"Каталог не существует: {path}"
+        return None, f"Directory doesn't exist: {path}"
     if not path.is_dir():
-        return None, f"Это не каталог: {path}"
+        return None, f"Not a directory: {path}"
 
     if PROJECT_STRICT:
         base = pathlib.Path(PROJECT_BASE_DIR).expanduser().resolve()
         # is_relative_to появился в 3.9; сравнение по частям надёжнее строкового
         # префикса, который считает /srv/app-old вложенным в /srv/app.
         if base != path and base not in path.parents:
-            return None, f"PROJECT_STRICT: разрешён только {base} и вложенные."
+            return None, f"PROJECT_STRICT: only {base} and its subdirectories are allowed."
 
     return str(path), ""
 
@@ -349,10 +368,20 @@ class Telegram:
             raise RuntimeError(f"{method} failed: {data}")
         return data["result"]
 
+    async def call_md(self, method: str, **params):
+        """Как call(), но рендерит Markdown и откатывается в plain text,
+        если разметка не закрыта (например, посреди стриминга дельт)."""
+        try:
+            return await self.call(method, parse_mode="Markdown", **params)
+        except RuntimeError as e:
+            if "can't parse entities" in str(e).lower():
+                return await self.call(method, **params)
+            raise
+
     async def send(self, chat_id: int, text: str, reply_to: Optional[int] = None):
         for chunk in _split(text, TG_MSG_LIMIT):
             try:
-                await self.call(
+                await self.call_md(
                     "sendMessage",
                     chat_id=chat_id,
                     text=chunk,
@@ -371,7 +400,7 @@ class Telegram:
 
 
 def _split(text: str, limit: int) -> List[str]:
-    text = (text or "").strip() or "(пустой ответ)"
+    text = (text or "").strip() or "(empty response)"
     if len(text) <= limit:
         return [text]
     parts, buf = [], ""
@@ -475,12 +504,12 @@ class StreamingMessage:
             return
         try:
             if self.message_id is None:
-                res = await self.tg.call(
+                res = await self.tg.call_md(
                     "sendMessage", chat_id=self.chat_id, text=text
                 )
                 self.message_id = res["message_id"]
             else:
-                await self.tg.call(
+                await self.tg.call_md(
                     "editMessageText",
                     chat_id=self.chat_id,
                     message_id=self.message_id,
@@ -544,6 +573,7 @@ class ChatActor:
 
         # метрики последнего хода
         self.context_tokens = 0
+        self._last_msg_usage: dict = {}     # usage последнего "assistant"-события хода
         self.turns = 0
         self.last_turn_steps = 0
         self._warned_context = False
@@ -598,7 +628,7 @@ class ChatActor:
                     await self.kill()
                     await self.tg.send(
                         self.chat_id,
-                        f"⚠️ Сбой сессии: {e}\nСледующее сообщение поднимет новую.",
+                        sys_text(f"⚠️ Session crashed: {e}\nNext message will start a fresh one."),
                     )
                     break
 
@@ -642,10 +672,12 @@ class ChatActor:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=STDOUT_LINE_LIMIT,
         )
         if not self.resumed:
             self.session_id = None
             self.context_tokens = 0
+            self._last_msg_usage = {}
             self.turns = 0
             self._warned_context = False
         asyncio.create_task(self._drain_stderr(self.proc))
@@ -679,6 +711,7 @@ class ChatActor:
         clear_session(self.chat_id)
         self.session_id = None
         self.context_tokens = 0
+        self._last_msg_usage = {}
         self.turns = 0
         self.last_turn_steps = 0
         self._warned_context = False
@@ -699,10 +732,10 @@ class ChatActor:
         was_live = self.alive()
         await self.kill()  # session_id сохраняем: контекст восстановится через --resume
 
-        tail = " Процесс перезапустится на следующем сообщении, контекст сохранён." if was_live else ""
+        tail = " Process will restart on the next message, context is preserved." if was_live else ""
         if self.system_prompt:
-            return f"Системный промпт установлен ({len(self.system_prompt)} симв.).{tail}"
-        return f"Системный промпт снят.{tail}"
+            return f"System prompt set ({len(self.system_prompt)} chars).{tail}"
+        return f"System prompt cleared.{tail}"
 
     async def set_model(self, model: str) -> str:
         """Смена модели требует рестарта процесса — контекст теряется."""
@@ -711,8 +744,8 @@ class ChatActor:
         had_context = self.alive() or bool(self.session_id)
         await self.reset()
         self.model = model  # reset не трогает модель, но перестрахуемся
-        note = "\nКонтекст сброшен — модель меняется только при старте процесса." if had_context else ""
-        return f"Модель: {old or 'по умолчанию'} → {model}{note}"
+        note = "\nContext reset — model only changes when the process (re)starts." if had_context else ""
+        return f"Model: {old or 'default'} → {model}{note}"
 
     async def set_workdir(self, raw: str) -> str:
         """
@@ -724,7 +757,7 @@ class ChatActor:
             return err
 
         if path == self.workdir:
-            return f"Каталог уже такой: {path}"
+            return f"Already in that directory: {path}"
 
         old = self.workdir
         had_context = self.alive() or bool(self.session_id)
@@ -732,8 +765,8 @@ class ChatActor:
         self.workdir = path
         save_workdir(self.chat_id, path)
 
-        note = "\nКонтекст сброшен — сессии привязаны к каталогу." if had_context else ""
-        return f"Каталог: {old} → {path}{note}"
+        note = "\nContext reset — sessions are tied to the working directory." if had_context else ""
+        return f"Directory: {old} → {path}{note}"
 
     async def compact(self) -> str:
         """
@@ -742,7 +775,7 @@ class ChatActor:
         процесс убиваем, конспект подмешиваем к следующему сообщению.
         """
         if not self.alive() and not self.session_id:
-            return "Сжимать нечего — активной сессии нет."
+            return "Nothing to compact — no active session."
 
         before = self.context_tokens
         prompt = (
@@ -756,13 +789,14 @@ class ChatActor:
             async with self.sem:
                 summary = await self._turn_once(prompt)
 
-        if not summary or summary == "(таймаут)":
-            return "Не удалось сжать контекст — сессия не ответила. Попробуй /clear."
+        if not summary or summary == "(timeout)":
+            return "Couldn't compact context — session didn't respond. Try /clear."
 
         await self.kill()
         clear_session(self.chat_id)
         self.session_id = None
         self.context_tokens = 0
+        self._last_msg_usage = {}
         self.turns = 0
         self.last_turn_steps = 0
         self._warned_context = False
@@ -770,8 +804,8 @@ class ChatActor:
 
         was = f"{_fmt_tokens(before)} " if before else ""
         return (
-            f"Контекст сжат. Было {was}→ конспект на {len(self.pending_seed)} символов.\n"
-            f"Он уйдёт вместе со следующим твоим сообщением."
+            f"Context compacted. Was {was}→ summary is {len(self.pending_seed)} chars.\n"
+            f"It'll be sent along with your next message."
         )
 
     # -- один ход -----------------------------------------------------------
@@ -780,7 +814,7 @@ class ChatActor:
         if time.monotonic() < self._blocked_until:
             await self.tg.send(
                 self.chat_id,
-                "⏸ Сессия отключена после серии сбоев. Проверь логи и что `claude` авторизован.",
+                sys_text("⏸ Session disabled after repeated crashes. Check the logs and that `claude` is authenticated."),
             )
             return
 
@@ -846,9 +880,9 @@ class ChatActor:
             await self.kill()
             self._note_crash()
             await self.tg.send(
-                self.chat_id, "⏱ Ход не завершился за отведённое время. Сессия перезапущена."
+                self.chat_id, sys_text("⏱ Turn didn't finish in time. Session restarted.")
             )
-            return "(таймаут)"
+            return "(timeout)"
         finally:
             if typing:
                 typing.cancel()
@@ -906,9 +940,13 @@ class ChatActor:
                 log.info("[%s] session %s", self.chat_id, self.session_id)
 
             elif etype == "assistant":
-                for block in ev.get("message", {}).get("content", []) or []:
+                message = ev.get("message", {})
+                for block in message.get("content", []) or []:
                     if isinstance(block, dict) and block.get("type") == "text":
                         collected.append(block.get("text", ""))
+                usage = message.get("usage")
+                if usage:
+                    self._last_msg_usage = usage
 
             elif etype == "result":
                 self._absorb_usage(ev)
@@ -934,8 +972,18 @@ class ChatActor:
                 stream.set_status(f"⚙️ {name}…")
 
     def _absorb_usage(self, ev: dict):
-        """Достаёт размер контекста из result. Поля версионно нестабильны."""
-        usage = ev.get("usage") or ev.get("message", {}).get("usage") or {}
+        """Достаёт размер контекста из последнего usage хода.
+
+        В событии result поле usage суммирует input/cache_read/cache_creation
+        по всем внутренним шагам хода (каждый вызов инструмента — отдельный
+        шаг с растущим cache_read), а не отражает фактический размер
+        контекста на конец хода. Поэтому берём usage последнего сообщения
+        assistant (self._last_msg_usage, см. _read_turn) — это одиночный
+        API-вызов без накопления, ровно тот контекст, что был отправлен
+        модели перед финальным ответом. result.usage — запасной вариант,
+        если по какой-то причине assistant-событие не пришло.
+        """
+        usage = self._last_msg_usage or ev.get("usage") or ev.get("message", {}).get("usage") or {}
         try:
             total = (
                 int(usage.get("input_tokens", 0) or 0)
@@ -963,35 +1011,37 @@ class ChatActor:
             pct = 100 * self.context_tokens / CONTEXT_WINDOW
             await self.tg.send(
                 self.chat_id,
-                f"ℹ️ Контекст занят на {pct:.0f}% "
-                f"({_fmt_tokens(self.context_tokens)} / {_fmt_tokens(CONTEXT_WINDOW)}). "
-                f"Автосжатия здесь нет — при переполнении ход упадёт. /clear начнёт заново.",
+                sys_text(
+                    f"ℹ️ Context is {pct:.0f}% full "
+                    f"({_fmt_tokens(self.context_tokens)} / {_fmt_tokens(CONTEXT_WINDOW)}). "
+                    f"There's no auto-compaction here — the turn will fail on overflow. /clear starts over."
+                ),
             )
 
     def context_report(self) -> str:
-        state = "генерация" if self.lock.locked() else ("запущен" if self.alive() else "остановлен")
+        state = "generating" if self.lock.locked() else ("running" if self.alive() else "stopped")
         if not self.context_tokens:
-            body = "Контекст: нет данных (ещё не было ходов в этой сессии)"
+            body = "Context: no data yet (no turns in this session)"
         else:
             pct = 100 * self.context_tokens / CONTEXT_WINDOW
             body = (
-                f"Контекст: {_fmt_tokens(self.context_tokens)} / "
+                f"Context: {_fmt_tokens(self.context_tokens)} / "
                 f"{_fmt_tokens(CONTEXT_WINDOW)} ({pct:.0f}%)"
             )
         lines = [
-            f"Модель: {self.model or 'по умолчанию'}",
-            f"Каталог: {self.workdir}",
+            f"Model: {self.model or 'default'}",
+            f"Directory: {self.workdir}",
             body,
-            f"Ходов в сессии: {self.turns}"
-            + (f" (в последнем шагов: {self.last_turn_steps})" if self.last_turn_steps > 1 else ""),
-            f"Процесс: {state}{' (возобновлён)' if self.resumed else ''}",
+            f"Turns in session: {self.turns}"
+            + (f" (steps in last turn: {self.last_turn_steps})" if self.last_turn_steps > 1 else ""),
+            f"Process: {state}{' (resumed)' if self.resumed else ''}",
             f"session_id: {self.session_id or '—'}",
-            f"В очереди: {len(self.mailbox)}",
+            f"Queued: {len(self.mailbox)}",
         ]
         if self.system_prompt:
-            lines.append(f"Системный промпт: задан, {len(self.system_prompt)} симв.")
+            lines.append(f"System prompt: set, {len(self.system_prompt)} chars.")
         if self.pending_seed:
-            lines.append(f"Ждёт конспект от /compact: {len(self.pending_seed)} симв.")
+            lines.append(f"Waiting on a /compact summary: {len(self.pending_seed)} chars.")
         return "\n".join(lines)
 
     def _note_crash(self):
@@ -1038,14 +1088,14 @@ class Supervisor:
 AWAIT_SYSTEM_S = 300.0
 
 HELP = (
-    "Команды:\n"
-    "/context — модель, промпт, заполнение контекста, состояние\n"
-    "/system — задать системный промпт (следующим сообщением)\n"
-    "/compact — сжать разговор в конспект и начать сессию заново\n"
-    "/clear — сбросить контекст начисто\n"
-    "/model [opus|sonnet|haiku] — сменить модель (сбрасывает контекст)\n"
-    "/cd [путь] — рабочий каталог (сбрасывает контекст)\n"
-    "/help — это сообщение"
+    "Commands:\n"
+    "/context — model, prompt, context usage, state\n"
+    "/system — set a system prompt (as the next message)\n"
+    "/compact — compact the conversation into a summary and start fresh\n"
+    "/clear — reset context completely\n"
+    "/model [opus|sonnet|haiku] — switch model (resets context)\n"
+    "/cd [path] — working directory (resets context)\n"
+    "/help — this message"
 )
 
 
@@ -1086,7 +1136,7 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
             if notify:
                 await tg.send(
                     chat_id,
-                    f"Сообщение проигнорировано: нет доступа.\nuser_id: {user_id}",
+                    sys_text(f"Message ignored: no access.\nuser_id: {user_id}"),
                     reply_to=msg.get("message_id"),
                 )
             return
@@ -1098,16 +1148,16 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
 
         if cmd in ("/start", "/help"):
             uid = (msg.get("from") or {}).get("id")
-            await tg.send(chat_id, f"Готов. chat_id: {chat_id}, user_id: {uid}\n\n{HELP}")
+            await tg.send(chat_id, sys_text(f"Ready. chat_id: {chat_id}, user_id: {uid}\n\n{HELP}"))
             return
 
         if cmd in ("/clear", "/reset", "/new"):
             await actor.reset()
-            await tg.send(chat_id, "Контекст сброшен. Следующее сообщение начнёт новую сессию.")
+            await tg.send(chat_id, sys_text("Context reset. Next message will start a new session."))
             return
 
         if cmd in ("/context", "/ctx"):
-            await tg.send(chat_id, actor.context_report())
+            await tg.send(chat_id, sys_text(actor.context_report()))
             return
 
         if cmd == "/model":
@@ -1115,13 +1165,15 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
             if len(parts) < 2:
                 await tg.send(
                     chat_id,
-                    f"Сейчас: {actor.model or 'по умолчанию'}\n"
-                    f"Сменить: /model {' | '.join(MODEL_ALIASES)}\n"
-                    f"Можно и полное имя вида claude-sonnet-4-6.\n"
-                    f"Смена перезапускает процесс — контекст теряется.",
+                    sys_text(
+                        f"Current: {actor.model or 'default'}\n"
+                        f"Change: /model {' | '.join(MODEL_ALIASES)}\n"
+                        f"A full name like claude-sonnet-4-6 also works.\n"
+                        f"Switching restarts the process — context is lost."
+                    ),
                 )
                 return
-            await tg.send(chat_id, await actor.set_model(parts[1].strip()))
+            await tg.send(chat_id, sys_text(await actor.set_model(parts[1].strip())))
             return
 
         if cmd in ("/cd", "/dir", "/project"):
@@ -1130,19 +1182,21 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
                 base = pathlib.Path(PROJECT_BASE_DIR).expanduser()
                 await tg.send(
                     chat_id,
-                    f"Сейчас: {actor.workdir}\n"
-                    f"Сменить: /cd <путь>\n"
-                    f"Относительный путь считается от {base}"
-                    + (" (выход за неё запрещён)" if PROJECT_STRICT else "")
-                    + "\nСмена сбрасывает контекст — сессии привязаны к каталогу.",
+                    sys_text(
+                        f"Current: {actor.workdir}\n"
+                        f"Change: /cd <path>\n"
+                        f"Relative paths are resolved from {base}"
+                        + (" (can't go outside it)" if PROJECT_STRICT else "")
+                        + "\nSwitching resets context — sessions are tied to the directory."
+                    ),
                 )
                 return
-            await tg.send(chat_id, await actor.set_workdir(parts[1]))
+            await tg.send(chat_id, sys_text(await actor.set_workdir(parts[1])))
             return
 
         if cmd == "/compact":
             await tg.typing(chat_id)
-            await tg.send(chat_id, await actor.compact())
+            await tg.send(chat_id, sys_text(await actor.compact()))
             return
 
         if cmd in ("/system", "/sys"):
@@ -1150,47 +1204,51 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
             arg = arg[1].strip() if len(arg) > 1 else ""
 
             if arg.lower() in ("off", "clear", "reset", "-"):
-                await tg.send(chat_id, await actor.set_system_prompt(None))
+                await tg.send(chat_id, sys_text(await actor.set_system_prompt(None)))
                 return
             if arg.lower() == "show":
                 await tg.send(
                     chat_id,
-                    f"Текущий системный промпт:\n\n{actor.system_prompt}"
-                    if actor.system_prompt else "Системный промпт не задан.",
+                    sys_text(
+                        f"Current system prompt:\n\n{actor.system_prompt}"
+                        if actor.system_prompt else "No system prompt set."
+                    ),
                 )
                 return
             if arg:
-                await tg.send(chat_id, await actor.set_system_prompt(arg))
+                await tg.send(chat_id, sys_text(await actor.set_system_prompt(arg)))
                 return
 
             # Без аргумента — ждём промпт следующим сообщением.
             actor.awaiting_system = time.monotonic()
             current = (
-                f"\n\nСейчас задан ({len(actor.system_prompt)} симв.), новый заменит его."
+                f"\n\nCurrently set ({len(actor.system_prompt)} chars), the new one will replace it."
                 if actor.system_prompt else ""
             )
             await tg.send(
                 chat_id,
-                "Пришли системный промпт следующим сообщением.\n"
-                "Он будет подставляться в каждую новую сессию этого чата "
-                "и переживёт /clear, /compact и перезапуск бота.\n"
-                "/system off — снять, /system show — посмотреть." + current,
+                sys_text(
+                    "Send the system prompt as your next message.\n"
+                    "It'll be applied to every new session in this chat "
+                    "and survives /clear, /compact, and bot restarts.\n"
+                    "/system off — clear it, /system show — view it." + current
+                ),
             )
             return
 
         # Остальные слэш-команды Claude Code (/cost, /resume, /vim) в headless
         # не работают: их обрабатывает интерактивный REPL, которого здесь нет.
         # Отбиваем, чтобы они молча не улетали в модель как обычный текст.
-        await tg.send(chat_id, f"Неизвестная команда.\n\n{HELP}")
+        await tg.send(chat_id, sys_text(f"Unknown command.\n\n{HELP}"))
         return
 
     # Ждём системный промпт следующим сообщением (окно 5 минут).
     if actor.awaiting_system:
         if time.monotonic() - actor.awaiting_system < AWAIT_SYSTEM_S:
-            await tg.send(chat_id, await actor.set_system_prompt(text))
+            await tg.send(chat_id, sys_text(await actor.set_system_prompt(text)))
             return
         actor.awaiting_system = 0.0
-        await tg.send(chat_id, "⌛ Ждал системный промпт слишком долго, отменил. Обрабатываю как обычное сообщение.")
+        await tg.send(chat_id, sys_text("⌛ Waited too long for the system prompt, cancelled. Treating this as a regular message."))
 
     # В группах Клод должен различать собеседников.
     if msg.get("chat", {}).get("type") != "private":
