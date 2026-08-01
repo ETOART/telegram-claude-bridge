@@ -55,6 +55,13 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", os.getcwd())
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 
+# База для относительных путей в /cd. Абсолютный путь и ~ идут мимо неё.
+PROJECT_BASE_DIR = os.environ.get("PROJECT_BASE_DIR", "") or CLAUDE_WORKDIR
+
+# Запереть /cd внутри PROJECT_BASE_DIR. По умолчанию выключено: фильтра по
+# chat_id нет, поэтому каталог сможет назначить любой, кто нашёл бота.
+PROJECT_STRICT = os.environ.get("PROJECT_STRICT", "0") not in ("0", "false", "no")
+
 # Модель по умолчанию для новых чатов. Пусто = решает сам Claude Code
 # (а он по умолчанию тянется к самой мощной, что для болтовни в мессенджере
 # избыточно и быстро съедает квоту).
@@ -150,6 +157,8 @@ def _db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
     if "system_prompt" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN system_prompt TEXT")
+    if "workdir" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN workdir TEXT")
     return conn
 
 
@@ -201,6 +210,62 @@ def load_model(chat_id: int) -> Optional[str]:
     except Exception as e:
         log.error("load_model: %s", e)
         return None
+
+
+def save_workdir(chat_id: int, workdir: str):
+    """Каталог переживает /clear, /compact и перезапуск скрипта."""
+    try:
+        with _db() as c:
+            c.execute(
+                "INSERT INTO sessions (chat_id, workdir, ts) VALUES (?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET workdir=excluded.workdir",
+                (chat_id, workdir, time.time()),
+            )
+    except Exception as e:
+        log.error("save_workdir: %s", e)
+
+
+def load_workdir(chat_id: int) -> Optional[str]:
+    try:
+        with _db() as c:
+            row = c.execute(
+                "SELECT workdir FROM sessions WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception as e:
+        log.error("load_workdir: %s", e)
+        return None
+
+
+def resolve_workdir(raw: str) -> Tuple[Optional[str], str]:
+    """
+    Разбирает аргумент /cd. Возвращает (путь, причина отказа).
+    Относительный путь считается от PROJECT_BASE_DIR, ~ разворачивается.
+    """
+    p = raw.strip().strip('"').strip("'")
+    if not p:
+        return None, "Пустой путь."
+    try:
+        path = pathlib.Path(p).expanduser()
+        if not path.is_absolute():
+            path = pathlib.Path(PROJECT_BASE_DIR).expanduser() / path
+        path = path.resolve()
+    except Exception as e:
+        return None, f"Не удалось разобрать путь: {e}"
+
+    if not path.exists():
+        return None, f"Каталог не существует: {path}"
+    if not path.is_dir():
+        return None, f"Это не каталог: {path}"
+
+    if PROJECT_STRICT:
+        base = pathlib.Path(PROJECT_BASE_DIR).expanduser().resolve()
+        # is_relative_to появился в 3.9; сравнение по частям надёжнее строкового
+        # префикса, который считает /srv/app-old вложенным в /srv/app.
+        if base != path and base not in path.parents:
+            return None, f"PROJECT_STRICT: разрешён только {base} и вложенные."
+
+    return str(path), ""
 
 
 def save_session(chat_id: int, session_id: str):
@@ -439,6 +504,7 @@ class ChatActor:
         self.resumed = False
         self.model: str = load_model(chat_id) or DEFAULT_MODEL
         self.system_prompt: Optional[str] = load_system_prompt(chat_id)
+        self.workdir: str = load_workdir(chat_id) or CLAUDE_WORKDIR
 
         # Режим «следующее сообщение — это системный промпт».
         self.awaiting_system: float = 0.0
@@ -545,7 +611,7 @@ class ChatActor:
         log.info("[%s] spawn: %s", self.chat_id, " ".join(shlex.quote(c) for c in cmd))
         self.proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=CLAUDE_WORKDIR,
+            cwd=self.workdir,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -619,6 +685,27 @@ class ChatActor:
         self.model = model  # reset не трогает модель, но перестрахуемся
         note = "\nКонтекст сброшен — модель меняется только при старте процесса." if had_context else ""
         return f"Модель: {old or 'по умолчанию'} → {model}{note}"
+
+    async def set_workdir(self, raw: str) -> str:
+        """
+        Смена каталога всегда рвёт сессию: --resume ищет её в каталоге,
+        из которого она была создана, и в новом месте просто не найдёт.
+        """
+        path, err = resolve_workdir(raw)
+        if not path:
+            return err
+
+        if path == self.workdir:
+            return f"Каталог уже такой: {path}"
+
+        old = self.workdir
+        had_context = self.alive() or bool(self.session_id)
+        await self.reset()
+        self.workdir = path
+        save_workdir(self.chat_id, path)
+
+        note = "\nКонтекст сброшен — сессии привязаны к каталогу." if had_context else ""
+        return f"Каталог: {old} → {path}{note}"
 
     async def compact(self) -> str:
         """
@@ -859,6 +946,7 @@ class ChatActor:
             )
         lines = [
             f"Модель: {self.model or 'по умолчанию'}",
+            f"Каталог: {self.workdir}",
             body,
             f"Ходов в сессии: {self.turns}",
             f"Процесс: {state}{' (возобновлён)' if self.resumed else ''}",
@@ -921,6 +1009,7 @@ HELP = (
     "/compact — сжать разговор в конспект и начать сессию заново\n"
     "/clear — сбросить контекст начисто\n"
     "/model [opus|sonnet|haiku] — сменить модель (сбрасывает контекст)\n"
+    "/cd [путь] — рабочий каталог (сбрасывает контекст)\n"
     "/help — это сообщение"
 )
 
@@ -961,6 +1050,22 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
                 )
                 return
             await tg.send(chat_id, await actor.set_model(parts[1].strip()))
+            return
+
+        if cmd in ("/cd", "/dir", "/project"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                base = pathlib.Path(PROJECT_BASE_DIR).expanduser()
+                await tg.send(
+                    chat_id,
+                    f"Сейчас: {actor.workdir}\n"
+                    f"Сменить: /cd <путь>\n"
+                    f"Относительный путь считается от {base}"
+                    + (" (выход за неё запрещён)" if PROJECT_STRICT else "")
+                    + "\nСмена сбрасывает контекст — сессии привязаны к каталогу.",
+                )
+                return
+            await tg.send(chat_id, await actor.set_workdir(parts[1]))
             return
 
         if cmd == "/compact":

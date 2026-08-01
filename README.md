@@ -78,6 +78,7 @@ Flag support is checked at startup by running `claude --help`. If the flag is mi
 | `/compact` | Compress the conversation into a summary and start a new session |
 | `/clear` (`/reset`, `/new`) | Terminate the process and drop the session binding. Model and system prompt are kept |
 | `/model` | Without an argument — print the current one. `/model sonnet` — switch |
+| `/cd` (`/dir`, `/project`) | Without an argument — print the current working directory. `/cd <path>` — switch |
 | `/start`, `/help` | Print `chat_id` and the command list |
 
 Any other line starting with `/` is rejected with a hint. Claude Code slash commands (`/cost`, `/resume`, `/vim` and the rest) do not work in `-p` mode — they are handled by the interactive REPL, which is not running here. Without the rejection they would be passed to the model as ordinary text.
@@ -102,6 +103,18 @@ The choice is stored per chat and survives `/clear`, `/compact` and script resta
 
 `--model` is a process start flag and cannot be changed on a running process. Switching the model therefore terminates the process and drops the session binding: context is lost.
 
+### Working directory
+
+Each chat has its own working directory, stored in SQLite and surviving `/clear`, `/compact` and script restarts. Chats that never ran `/cd` use `CLAUDE_WORKDIR`.
+
+Relative paths resolve against `PROJECT_BASE_DIR`, `~` expands to the home directory, absolute paths are taken as they are. The target must exist and be a directory.
+
+Switching always drops the session: `--resume` looks for a session in the directory that created it and will not find it elsewhere.
+
+Note that the directory decides what Claude Code sees. Its default system prompt carries the working directory and git status, so the agent introduces itself as working on whatever project it is pointed at.
+
+`PROJECT_STRICT=1` confines `/cd` to `PROJECT_BASE_DIR` and its subdirectories. It is off by default. Since there is no `chat_id` filter, anyone who finds the bot can set the directory, and the agent has file and shell tools — turn it on to bound the reach.
+
 ### Context and `/compact`
 
 In `-p` mode there is no automatic context compaction. Exceeding the context window fails the request. The script warns once per session when the window is `CONTEXT_WARN_RATIO` (70%) full.
@@ -124,7 +137,9 @@ Cost is one extra model request. No separate request is spent on delivering the 
 | `TELEGRAM_BOT_TOKEN` | — | Required. Token from BotFather |
 | `CLAUDE_BIN` | `claude` | Path to the executable, if it is not on PATH |
 | `CLAUDE_MODEL` | `sonnet` | Model for new chats |
-| `CLAUDE_WORKDIR` | current directory | Working directory of the process. `--resume` is bound to the path: saved sessions are not found if the directory changes |
+| `CLAUDE_WORKDIR` | current directory | Default working directory for chats that have not used `/cd`. `--resume` is bound to the path: saved sessions are not found if the directory changes |
+| `PROJECT_BASE_DIR` | `CLAUDE_WORKDIR` | Base for relative paths in `/cd` |
+| `PROJECT_STRICT` | `0` | `1` confines `/cd` to `PROJECT_BASE_DIR` and its subdirectories |
 | `CLAUDE_EXTRA_ARGS` | empty | Extra flags, e.g. `--mcp-config ./mcp.json` |
 | `CLAUDE_SYSTEM_APPEND` | Telegram formatting instructions | Base part of the system prompt |
 | `STATE_DB` | `state.db` | SQLite file with settings and chat-to-session bindings |
