@@ -519,6 +519,7 @@ class ChatActor:
         # метрики последнего хода
         self.context_tokens = 0
         self.turns = 0
+        self.last_turn_steps = 0
         self._warned_context = False
 
         self._debounce: Optional[asyncio.Task] = None
@@ -653,6 +654,7 @@ class ChatActor:
         self.session_id = None
         self.context_tokens = 0
         self.turns = 0
+        self.last_turn_steps = 0
         self._warned_context = False
         self.mailbox.clear()
         self._crashes = 0
@@ -736,6 +738,7 @@ class ChatActor:
         self.session_id = None
         self.context_tokens = 0
         self.turns = 0
+        self.last_turn_steps = 0
         self._warned_context = False
         self.pending_seed = summary.strip()
 
@@ -918,7 +921,12 @@ class ChatActor:
                 self.context_tokens = total
         except Exception:
             pass
-        self.turns = ev.get("num_turns") or (self.turns + 1)
+        # num_turns считает шаги внутри одного запроса (вызовы инструментов),
+        # а не ходы диалога: без инструментов он всегда 1, поэтому раньше
+        # счётчик сессии стоял на единице. Ходы считаем сами, а num_turns
+        # оставляем как отдельную метрику — по ней видно работу инструментов.
+        self.turns += 1
+        self.last_turn_steps = int(ev.get("num_turns") or 1)
         log.debug("[%s] usage=%s ctx=%s", self.chat_id, usage, self.context_tokens)
 
     async def _maybe_warn_context(self):
@@ -948,7 +956,8 @@ class ChatActor:
             f"Модель: {self.model or 'по умолчанию'}",
             f"Каталог: {self.workdir}",
             body,
-            f"Ходов в сессии: {self.turns}",
+            f"Ходов в сессии: {self.turns}"
+            + (f" (в последнем шагов: {self.last_turn_steps})" if self.last_turn_steps > 1 else ""),
             f"Процесс: {state}{' (возобновлён)' if self.resumed else ''}",
             f"session_id: {self.session_id or '—'}",
             f"В очереди: {len(self.mailbox)}",
@@ -1131,6 +1140,12 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
 async def poll(sup: Supervisor, tg: Telegram, stop: asyncio.Event):
     offset = 0
     seen: set = set()
+    fails = 0
+
+    def backoff() -> float:
+        # 2, 4, 8, 16, 30, 30… — чтобы при недоступном Telegram не долбить раз в 3 с.
+        return min(2.0 ** min(fails, 5), 30.0)
+
     while not stop.is_set():
         try:
             updates = await tg.call(
@@ -1142,10 +1157,27 @@ async def poll(sup: Supervisor, tg: Telegram, stop: asyncio.Event):
             )
         except asyncio.TimeoutError:
             continue
-        except Exception as e:
-            log.error("getUpdates: %s", e)
-            await asyncio.sleep(3)
+        except (aiohttp.ClientError, OSError) as e:
+            # Разрыв длинного соединения — рядовое событие long polling, а не
+            # поломка: Telegram закрывает соединение сам. ERROR тут только
+            # засоряет лог, поэтому шумим лишь когда обрывы идут подряд.
+            fails += 1
+            delay = backoff()
+            log.log(
+                logging.WARNING if fails >= 3 else logging.DEBUG,
+                "getUpdates: обрыв связи (%s), подряд %d, пауза %.0f c",
+                e, fails, delay,
+            )
+            await asyncio.sleep(delay)
             continue
+        except Exception as e:
+            fails += 1
+            delay = backoff()
+            log.error("getUpdates: %s (пауза %.0f c)", e, delay)
+            await asyncio.sleep(delay)
+            continue
+
+        fails = 0
 
         for upd in updates:
             offset = max(offset, upd["update_id"] + 1)
