@@ -30,7 +30,7 @@ python tg_claude_bot.py
 
 Settings live in `.env`, which is loaded from the script's own directory — the working directory you launch from does not matter. Real environment variables take precedence over the file, so `TELEGRAM_BOT_TOKEN=... python tg_claude_bot.py` and `docker run --env-file` still work as overrides. [`.env.example`](.env.example) lists every supported variable with its default.
 
-There is no `chat_id` filter: the bot replies in any chat it is added to. Sessions consume your Claude Code subscription quota. To restrict access, add a `chat_id` check at the top of `handle()`.
+By default the bot replies to everyone, and sessions consume your Claude Code subscription quota. Set `ALLOWED_USERS` to restrict it — see [Access](#access).
 
 ---
 
@@ -103,6 +103,22 @@ The choice is stored per chat and survives `/clear`, `/compact` and script resta
 
 `--model` is a process start flag and cannot be changed on a running process. Switching the model therefore terminates the process and drops the session binding: context is lost.
 
+### Access
+
+`ALLOWED_USERS` is a comma-separated list of Telegram user IDs:
+
+```env
+ALLOWED_USERS=622492578,166090940
+```
+
+The check is per user and applies in every chat, so adding the bot to a group grants nothing to the other members — each of them is checked individually. It runs before anything else, so a stranger never starts a process or spends quota.
+
+A rejected user gets a short reply with their own `user_id` in a private chat, so they can pass it on to be added. In groups the bot stays silent: with privacy mode off it would otherwise answer every message from every member.
+
+Send `/start` to learn your own `user_id`. Entries that are not numbers are skipped with a warning at startup — a typo would otherwise lock you out quietly.
+
+Leaving the list empty keeps the bot open to everyone.
+
 ### Working directory
 
 Each chat has its own working directory, stored in SQLite and surviving `/clear`, `/compact` and script restarts. Chats that never ran `/cd` use `CLAUDE_WORKDIR`.
@@ -135,6 +151,7 @@ Cost is one extra model request. No separate request is spent on delivering the 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | Required. Token from BotFather |
+| `ALLOWED_USERS` | empty | Comma-separated user IDs allowed to use the bot. Empty lets everyone in |
 | `CLAUDE_BIN` | `claude` | Path to the executable, if it is not on PATH |
 | `CLAUDE_MODEL` | `sonnet` | Model for new chats |
 | `CLAUDE_WORKDIR` | current directory | Default working directory for chats that have not used `/cd`. `--resume` is bound to the path: saved sessions are not found if the directory changes |

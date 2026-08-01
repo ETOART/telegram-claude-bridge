@@ -55,6 +55,27 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_WORKDIR = os.environ.get("CLAUDE_WORKDIR", os.getcwd())
 CLAUDE_EXTRA_ARGS = shlex.split(os.environ.get("CLAUDE_EXTRA_ARGS", ""))
 
+# Белый список по user_id: пускаем конкретных людей в любом чате, а не чаты
+# целиком. Пусто = пускаем всех (поведение по умолчанию не меняется).
+# Мусорные значения не глотаем молча — о них предупреждаем при старте.
+_BAD_ALLOWED: List[str] = []
+
+
+def _parse_user_ids(raw: str) -> set:
+    out = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            _BAD_ALLOWED.append(part)
+    return out
+
+
+ALLOWED_USERS = _parse_user_ids(os.environ.get("ALLOWED_USERS", ""))
+
 # База для относительных путей в /cd. Абсолютный путь и ~ идут мимо неё.
 PROJECT_BASE_DIR = os.environ.get("PROJECT_BASE_DIR", "") or CLAUDE_WORKDIR
 
@@ -1029,13 +1050,28 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     if not text:
         return
 
+    # Проверка до создания актора: посторонний не должен поднимать процесс.
+    if ALLOWED_USERS:
+        user_id = (msg.get("from") or {}).get("id")
+        if user_id not in ALLOWED_USERS:
+            if msg.get("chat", {}).get("type") == "private":
+                # Личка: отвечаем, чтобы человек мог назвать свой id владельцу.
+                log.warning("отказ: user_id=%s chat_id=%s", user_id, chat_id)
+                await tg.send(chat_id, f"Нет доступа.\nТвой user_id: {user_id}")
+            else:
+                # Группа: молчим. Иначе с выключенным privacy mode бот засыпет
+                # чат отказами на каждое сообщение любого участника.
+                log.debug("отказ в группе: user_id=%s chat_id=%s", user_id, chat_id)
+            return
+
     actor = sup.actor(chat_id)
 
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0].lower()
 
         if cmd in ("/start", "/help"):
-            await tg.send(chat_id, f"Готов. chat_id: {chat_id}\n\n{HELP}")
+            uid = (msg.get("from") or {}).get("id")
+            await tg.send(chat_id, f"Готов. chat_id: {chat_id}, user_id: {uid}\n\n{HELP}")
             return
 
         if cmd in ("/clear", "/reset", "/new"):
@@ -1221,6 +1257,13 @@ async def main():
             "и впишите токен от @BotFather"
         )
 
+    if _BAD_ALLOWED:
+        # Молча выкинутый id — это либо запертый владелец, либо дыра в списке.
+        log.warning(
+            "ALLOWED_USERS: не разобраны и пропущены %s — нужны числовые id",
+            ", ".join(repr(x) for x in _BAD_ALLOWED),
+        )
+
     await _check_streaming_support()
 
     stop = asyncio.Event()
@@ -1235,8 +1278,10 @@ async def main():
         tg = Telegram(BOT_TOKEN, session)
         me = await tg.call("getMe")
         log.info(
-            "бот @%s готов | workdir=%s | db=%s | стриминг=%s",
-            me.get("username"), CLAUDE_WORKDIR, STATE_DB, "вкл" if STREAMING else "выкл",
+            "бот @%s готов | workdir=%s | db=%s | стриминг=%s | доступ: %s",
+            me.get("username"), CLAUDE_WORKDIR, STATE_DB,
+            "вкл" if STREAMING else "выкл",
+            f"{len(ALLOWED_USERS)} user_id" if ALLOWED_USERS else "открыт всем",
         )
 
         sup = Supervisor(tg)
