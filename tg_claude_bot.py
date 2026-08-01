@@ -23,8 +23,10 @@ session_id пишется в SQLite, поэтому после перезапу�
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import pathlib
+import re
 import shlex
 import signal
 import sqlite3
@@ -164,7 +166,11 @@ SYSTEM_APPEND = os.environ.get(
     "Headers (#), tables and nested formatting don't render — avoid those, "
     "use a plain '-' for list items instead. Keep it compact. In group "
     "chats, messages arrive prefixed with [Name]: — that's how you tell "
-    "people apart.",
+    "people apart. Incoming photos/videos/documents/voice are saved to disk "
+    "and mentioned as a file path in the chat, not inlined. To send the "
+    "user a file (image, document, etc.) yourself, put [[send: path]] "
+    "anywhere in your reply (path relative to the working directory or "
+    "absolute) — it's uploaded and stripped from what's shown.",
 )
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
@@ -398,6 +404,29 @@ class Telegram:
         except Exception:
             pass
 
+    async def download_file(self, file_id: str) -> bytes:
+        """Скачивает файл по file_id (фото, видео, документ — что угодно)."""
+        info = await self.call("getFile", file_id=file_id)
+        file_path = info["file_path"]
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
+            resp.raise_for_status()
+            return await resp.read()
+
+    async def send_file(self, chat_id: int, path: pathlib.Path):
+        """Отправляет локальный файл: картинки — как sendPhoto, остальное — sendDocument."""
+        is_image = path.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp")
+        method, field = ("sendPhoto", "photo") if is_image else ("sendDocument", "document")
+        url = TG_API.format(token=self.token, method=method)
+        data = aiohttp.FormData()
+        data.add_field("chat_id", str(chat_id))
+        data.add_field(field, path.read_bytes(), filename=path.name)
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with self.session.post(url, data=data, timeout=timeout) as resp:
+            result = await resp.json()
+        if not result.get("ok"):
+            raise RuntimeError(f"{method} failed: {result}")
+
 
 def _split(text: str, limit: int) -> List[str]:
     text = (text or "").strip() or "(empty response)"
@@ -424,6 +453,20 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
+
+
+_SEND_RE = re.compile(r"\[\[send:\s*(.+?)\s*\]\]")
+
+
+def _extract_send_files(answer: str, workdir: str) -> Tuple[str, List[pathlib.Path]]:
+    """Достаёт из ответа Клода метки [[send: путь]]. Возвращает (текст без меток, пути)."""
+    paths = []
+    for m in _SEND_RE.finditer(answer):
+        p = pathlib.Path(m.group(1))
+        if not p.is_absolute():
+            p = pathlib.Path(workdir) / p
+        paths.append(p)
+    return _SEND_RE.sub("", answer).strip(), paths
 
 
 class StaleSession(RuntimeError):
@@ -839,12 +882,21 @@ class ChatActor:
         self._crashes = 0
         self.last_activity = time.monotonic()
 
+        answer, files_to_send = _extract_send_files(answer, self.workdir)
+
         if stream and (stream.started or stream.message_id):
             await stream.finish(answer)
         else:
             if stream:
                 await stream.abort()
             await self.tg.send(self.chat_id, answer)
+
+        for path in files_to_send:
+            try:
+                await self.tg.send_file(self.chat_id, path)
+            except Exception as e:
+                log.error("[%s] send_file %s: %s", self.chat_id, path, e)
+                await self.tg.send(self.chat_id, sys_text(f"Couldn't send {path.name}: {e}"))
 
         await self._maybe_warn_context()
 
@@ -1102,6 +1154,24 @@ HELP = (
 _deny_notified: Dict[Tuple[int, int], float] = {}
 
 
+def _incoming_attachment(msg: dict) -> Optional[Tuple[str, str]]:
+    """(file_id, предложенное имя файла) для вложения любого типа. None, если вложения нет."""
+    if msg.get("photo"):
+        f = msg["photo"][-1]          # последний элемент — самое большое разрешение
+        return f["file_id"], f"{f['file_unique_id']}.jpg"
+    for field, default_ext in (
+        ("video", ".mp4"), ("video_note", ".mp4"), ("animation", ".mp4"),
+        ("voice", ".ogg"), ("audio", ".mp3"), ("document", ""),
+    ):
+        f = msg.get(field)
+        if not f:
+            continue
+        ext = mimetypes.guess_extension(f.get("mime_type") or "") or default_ext
+        name = f.get("file_name") or f"{f['file_unique_id']}{ext}"
+        return f["file_id"], name
+    return None
+
+
 def _should_notify_denial(chat_id: int, user_id: Optional[int]) -> bool:
     """Первый отказ проговариваем, повторы в пределах паузы — молча."""
     if DENY_NOTICE_COOLDOWN_S <= 0:
@@ -1118,8 +1188,9 @@ def _should_notify_denial(chat_id: int, user_id: Optional[int]) -> bool:
 
 async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     chat_id = msg["chat"]["id"]
+    attachment = _incoming_attachment(msg)
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    if not text:
+    if not text and not attachment:
         return
 
     # Проверка до создания актора: посторонний не должен поднимать процесс.
@@ -1142,6 +1213,32 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
             return
 
     actor = sup.actor(chat_id)
+
+    if attachment:
+        file_id, filename = attachment
+        is_group = msg.get("chat", {}).get("type") != "private"
+        who = (msg.get("from") or {}).get("first_name") or "user"
+
+        dest_dir = pathlib.Path(actor.workdir) / "telegram-uploads"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{msg.get('message_id')}_{filename}"
+        try:
+            data = await tg.download_file(file_id)
+            dest.write_bytes(data)
+        except Exception as e:
+            log.error("[%s] file download: %s", chat_id, e)
+            await tg.send(chat_id, sys_text(f"Couldn't download the file: {e}"))
+            return
+
+        # Файл лежит в рабочей папке — дальше Клод читает/обрабатывает его
+        # своими обычными инструментами (Read, Bash), как в обычном CLI.
+        note = f"[Telegram attachment saved to {dest.relative_to(actor.workdir)}]"
+        if text:
+            note += f"\n{text}"
+        if is_group:
+            note = f"[{who}]: {note}"
+        await actor.submit(note)
+        return
 
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0].lower()
