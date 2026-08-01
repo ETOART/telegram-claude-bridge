@@ -11,17 +11,22 @@
 ## Установка
 
 ```bash
-pip install aiohttp
+pip install -r requirements.txt
 ```
 
-Токен получить у [@BotFather](https://t.me/BotFather) командой `/newbot`.
+Токен получить у [@BotFather](https://t.me/BotFather) командой `/newbot` и вписать в `.env`:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
+cp .env.example .env
+```
+
+```bash
 python tg_claude_bot.py
 ```
 
 Требуется, чтобы `claude` был установлен и авторизован (проверяется запуском `claude` в терминале).
+
+Настройки лежат в `.env`, который читается рядом со скриптом — из какого каталога запускать, неважно. Переменные окружения приоритетнее файла, поэтому `TELEGRAM_BOT_TOKEN=... python tg_claude_bot.py` и `docker run --env-file` продолжают работать как переопределение. Полный список переменных с дефолтами — в [`.env.example`](.env.example).
 
 Фильтра по `chat_id` нет: бот отвечает в любом чате, куда добавлен. Сессии расходуют квоту подписки Claude Code. Если доступ нужно ограничить, добавьте проверку `chat_id` в начало `handle()`.
 

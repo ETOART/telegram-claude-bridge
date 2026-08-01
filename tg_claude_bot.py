@@ -10,10 +10,10 @@ session_id пишется в SQLite, поэтому после перезапу�
 возобновляется через --resume (если пауза не слишком велика).
 
 Зависимости:
-    pip install aiohttp
+    pip install -r requirements.txt
 
 Запуск:
-    export TELEGRAM_BOT_TOKEN="123456:ABC..."
+    cp .env.example .env   # и вписать TELEGRAM_BOT_TOKEN
     python tg_claude_bot.py
 
 Авторизация Claude берётся из локального логина (`claude` уже авторизован).
@@ -33,10 +33,21 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
+from dotenv import load_dotenv
 
 # --------------------------------------------------------------------------
 # Конфигурация
 # --------------------------------------------------------------------------
+
+# .env читается рядом со скриптом, а не в текущем каталоге: запуск из другого
+# места (systemd, cron) не должен менять набор настроек. Уже установленные
+# переменные окружения приоритетнее файла — override=False по умолчанию,
+# поэтому `TELEGRAM_BOT_TOKEN=... python tg_claude_bot.py` перекрывает .env.
+#
+# utf-8-sig, а не utf-8: Блокнот и `Set-Content -Encoding utf8` пишут BOM,
+# он приклеивается к имени первого ключа, и TELEGRAM_BOT_TOKEN не читается
+# при визуально правильном файле. Файлы без BOM utf-8-sig читает так же.
+load_dotenv(pathlib.Path(__file__).resolve().with_name(".env"), encoding="utf-8-sig")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
@@ -1068,7 +1079,10 @@ async def _check_streaming_support():
 
 async def main():
     if not BOT_TOKEN:
-        sys.exit("Не задан TELEGRAM_BOT_TOKEN")
+        sys.exit(
+            "Не задан TELEGRAM_BOT_TOKEN: скопируйте .env.example в .env "
+            "и впишите токен от @BotFather"
+        )
 
     await _check_streaming_support()
 

@@ -13,19 +13,22 @@ The process does not exit after answering: it stays up and reads stdin. Startup 
 ## Installation
 
 ```bash
-pip install aiohttp
+pip install -r requirements.txt
 ```
 
-Get a token from [@BotFather](https://t.me/BotFather) with `/newbot`.
+Get a token from [@BotFather](https://t.me/BotFather) with `/newbot`, then put it into `.env`:
 
 ```bash
-export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
+cp .env.example .env
+```
+
+```bash
 python tg_claude_bot.py
 ```
 
 `claude` must be installed and authenticated (verify by running `claude` in a terminal).
 
-See [`.env.example`](.env.example) for every supported variable. The script reads the process environment and does not parse `.env` itself, so load it first — `set -a; . ./.env; set +a` in bash, or `--env-file` under Docker.
+Settings live in `.env`, which is loaded from the script's own directory — the working directory you launch from does not matter. Real environment variables take precedence over the file, so `TELEGRAM_BOT_TOKEN=... python tg_claude_bot.py` and `docker run --env-file` still work as overrides. [`.env.example`](.env.example) lists every supported variable with its default.
 
 There is no `chat_id` filter: the bot replies in any chat it is added to. Sessions consume your Claude Code subscription quota. To restrict access, add a `chat_id` check at the top of `handle()`.
 
