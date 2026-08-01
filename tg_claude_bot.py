@@ -522,7 +522,10 @@ class StreamingMessage:
             return
 
     async def _render(self, final: bool = False):
-        target = self.buf if self.buf else self.status
+        # Статус (какой тул сейчас крутится) дописываем под текстом, а не только
+        # пока текста ещё нет — иначе после первой же дельты дальнейшие вызовы
+        # инструментов происходят молча и выглядят как зависание.
+        target = f"{self.buf}\n\n{self.status}" if self.status else self.buf
         if not target:
             return
 
@@ -536,7 +539,7 @@ class StreamingMessage:
             self.done_len += len(head)
             self.message_id = None
             self.shown = ""
-            target = self.buf
+            target = f"{self.buf}\n\n{self.status}" if self.status else self.buf
 
         if target != self.shown:
             await self._push(target)
@@ -575,6 +578,7 @@ class StreamingMessage:
         self._closed = True
         if self._task:
             self._task.cancel()
+        self.status = ""  # финальный текст не должен тащить хвост "⚙️ тул…"
 
         # result авторитетнее накопленных дельт.
         if final_text and final_text.strip():
@@ -920,8 +924,10 @@ class ChatActor:
             self._note_crash()
             raise RuntimeError("процесс claude недоступен")
 
-        # При стриминге индикатор «печатает» не нужен: виден растущий текст.
-        typing = None if stream is not None else asyncio.create_task(self._typing_loop())
+        # Индикатор «печатает» держим и при стриминге тоже: текст растёт не
+        # непрерывно (паузы на тул-коллах, thinking), а без него в такие
+        # моменты не отличить «завис» от «работает».
+        typing = asyncio.create_task(self._typing_loop())
         if stream is not None:
             stream.start()
         try:
@@ -1022,6 +1028,8 @@ class ChatActor:
             if block.get("type") == "tool_use":
                 name = block.get("name") or "инструмент"
                 stream.set_status(f"⚙️ {name}…")
+            elif block.get("type") == "text":
+                stream.set_status("")  # снова пошёл текст — статус тула убираем
 
     def _absorb_usage(self, ev: dict):
         """Достаёт размер контекста из последнего usage хода.
