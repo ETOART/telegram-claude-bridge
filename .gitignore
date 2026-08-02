@@ -13,6 +13,13 @@ venv/
 env/
 *.egg-info/
 
+# Runtime logs and restart helper
+*.log
+restart_bridge.ps1
+
+# Incoming Telegram attachments (user data)
+telegram-uploads/
+
 # Editors / OS
 .vscode/
 .idea/

@@ -168,9 +168,13 @@ SYSTEM_APPEND = os.environ.get(
     "chats, messages arrive prefixed with [Name]: — that's how you tell "
     "people apart. Incoming photos/videos/documents/voice are saved to disk "
     "and mentioned as a file path in the chat, not inlined. To send the "
-    "user a file (image, document, etc.) yourself, put [[send: path]] "
-    "anywhere in your reply (path relative to the working directory or "
-    "absolute) — it's uploaded and stripped from what's shown.",
+    "user a file (image, document, etc.) yourself, write the marker exactly "
+    "as [[send: path]] with DOUBLE square brackets, on its own line (path "
+    "relative to the working directory or absolute). The bridge intercepts "
+    "that marker, uploads the file as a real attachment, and strips the "
+    "marker from the text — so the file is actually delivered, not just "
+    "named. Don't describe the path in prose expecting it to be sent; only "
+    "the [[send: ...]] marker triggers an upload.",
 )
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
@@ -413,14 +417,81 @@ class Telegram:
             resp.raise_for_status()
             return await resp.read()
 
+    @staticmethod
+    async def _await_ready_file(
+        path: pathlib.Path, *,
+        appear: float = 4.0, quiet: float = 1.2, timeout: float = 60.0, poll: float = 0.4,
+    ) -> bool:
+        """Ждёт, пока путь станет готовым к отправке файлом.
+
+        True  — файл появился и запись завершилась (размер/mtime замерли).
+        False — за `appear` секунд обычного файла так и не возникло (или это
+                папка): почти наверняка метку лишь упомянули в тексте, а не
+                вызвали командой — слать нечего (см. SkipSend).
+
+        Ждём именно по размеру, а не только ловим Errno 13 на чтении: писатель
+        (рендер, ffmpeg) может и не держать эксклюзивный лок — тогда read_bytes
+        вернул бы обрезанный файл, и уехала бы битая картинка без ошибки.
+        """
+        # Фаза 1 — дождаться появления обычного файла.
+        start = time.monotonic()
+        while not path.is_file():
+            if path.is_dir() or time.monotonic() - start >= appear:
+                return False
+            await asyncio.sleep(poll)
+
+        # Фаза 2 — дождаться, пока размер и mtime замрут на `quiet` секунд.
+        deadline = time.monotonic() + timeout
+        last_sig = None
+        stable_since = None
+        while True:
+            try:
+                st = path.stat()
+                sig = (st.st_size, st.st_mtime_ns)
+                nonzero = st.st_size > 0
+            except (FileNotFoundError, OSError):
+                sig, nonzero = None, False
+
+            now = time.monotonic()
+            if sig is not None and sig == last_sig and nonzero:
+                if stable_since is None:
+                    stable_since = now
+                elif now - stable_since >= quiet:
+                    return True
+            else:
+                stable_since = None
+                last_sig = sig
+
+            if now >= deadline:
+                return True               # не устаканился, но файл есть — пусть решает чтение
+            await asyncio.sleep(poll)
+
+    @staticmethod
+    async def _read_file_bytes(path: pathlib.Path) -> bytes:
+        """Читает файл, дождавшись конца записи и пережив эксклюзивный лок.
+        Если реального файла нет — поднимает SkipSend (тихий пропуск)."""
+        if not await Telegram._await_ready_file(path):
+            raise SkipSend(str(path))
+        # Подстраховка от эксклюзивного лока в момент чтения: даём дописаться и
+        # пробуем снова, с нарастающей паузой.
+        last: Optional[Exception] = None
+        for i in range(9):
+            try:
+                return path.read_bytes()
+            except (PermissionError, OSError) as e:
+                last = e
+                await asyncio.sleep(min(0.5 * (i + 1), 3.0))
+        raise RuntimeError(f"still locked/unreadable after retries: {last}")
+
     async def send_file(self, chat_id: int, path: pathlib.Path):
         """Отправляет локальный файл: картинки — как sendPhoto, остальное — sendDocument."""
+        payload = await self._read_file_bytes(path)
         is_image = path.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp")
         method, field = ("sendPhoto", "photo") if is_image else ("sendDocument", "document")
         url = TG_API.format(token=self.token, method=method)
         data = aiohttp.FormData()
         data.add_field("chat_id", str(chat_id))
-        data.add_field(field, path.read_bytes(), filename=path.name)
+        data.add_field(field, payload, filename=path.name)
         timeout = aiohttp.ClientTimeout(total=120)
         async with self.session.post(url, data=data, timeout=timeout) as resp:
             result = await resp.json()
@@ -455,7 +526,24 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-_SEND_RE = re.compile(r"\[\[send:\s*(.+?)\s*\]\]")
+# TODO: ненадёжный текстовый протокол отправки файлов.
+# Отправка держится на том, что модель дословно напечатает метку
+# [[send: путь]], а мост выловит её регуляркой. Это принципиально
+# вероятностно: модель роняет скобку, заворачивает метку в кодблок или
+# перефразирует — и файл молча не уходит, а сырая строка утекает в текст
+# (ровно этот баг и ловили). Терпимая регулярка ниже (1-2 скобки) — стоп-гэп,
+# а не решение: она же возвращает риск ложных срабатываний, ради ухода от
+# которого двойные скобки изначально и вводили. Надёжно чинится только уходом
+# от текстового протокола к структурированному вызову (отдельный инструмент
+# «отправить файл», который модель вызывает явно, без парсинга прозы).
+# Конкретную реализацию пока не фиксируем.
+#
+# Основная форма — [[send: путь]]. Одинарные скобки [send: путь] тоже
+# принимаем как стоп-гэп: модель нередко роняет вторую скобку.
+_SEND_RE = re.compile(r"\[\[?\s*send:\s*(.+?)\s*\]\]?")
+# Ещё не закрытая метка в хвосте растущего сообщения (её дописывают прямо
+# сейчас) — чтобы в стриминге не мигало полусырое "[send: C:\...".
+_SEND_RE_TAIL = re.compile(r"\[\[?\s*send:[^\]\n]*$")
 
 
 def _extract_send_files(answer: str, workdir: str) -> Tuple[str, List[pathlib.Path]]:
@@ -473,6 +561,16 @@ class StaleSession(RuntimeError):
     """--resume не смог подняться: сессия протухла или не найдена."""
 
 
+class Interrupted(RuntimeError):
+    """Пользователь оборвал текущий ход командой /stop."""
+
+
+class SkipSend(RuntimeError):
+    """Метка [[send:]] указала не на реальный файл (не появился за grace-окно
+    или это папка). Почти наверняка маркер лишь упомянут в тексте, а не вызван
+    как команда — отправлять нечего, ошибку в чат не шлём."""
+
+
 # --------------------------------------------------------------------------
 # Актор: один процесс claude -p на чат
 # --------------------------------------------------------------------------
@@ -486,18 +584,64 @@ class StreamingMessage:
     поэтому done_len хранит, сколько символов уже ушло в закрытые.
     """
 
-    def __init__(self, tg: "Telegram", chat_id: int):
+    def __init__(self, tg: "Telegram", chat_id: int, workdir: str = "."):
         self.tg = tg
         self.chat_id = chat_id
+        self.workdir = workdir
         self.message_id: Optional[int] = None
-        self.buf = ""        # текст текущего сообщения
+        self.buf = ""        # текст текущего сообщения (сырой, с метками)
         self.shown = ""      # что уже отрисовано в текущем сообщении
         self.status = ""     # чем занят Клод, пока нет текста
         self.done_len = 0    # символов ответа в закрытых сообщениях
         self.started = False # была ли хоть одна дельта
+        self.sent_paths: set = set()  # что уже ушло как файл — от повторной отправки
         self._task: Optional[asyncio.Task] = None
         self._closed = False
         self._interval = EDIT_INTERVAL_S
+
+    # -- отправка медиа прямо по ходу стриминга ----------------------------
+
+    def _harvest_sends(self):
+        """Дописанные метанки [[send: путь]] превращаем в отправку файла и
+        вырезаем из буфера — сразу, не дожидаясь конца хода, чтобы метка не
+        оставалась строкой в размышлениях."""
+        if "send:" not in self.buf:
+            return
+        self.buf = _SEND_RE.sub(self._on_marker, self.buf)
+
+    def _on_marker(self, m: "re.Match") -> str:
+        self._fire_send((m.group(1) or "").strip())
+        return ""
+
+    def _fire_send(self, raw: str):
+        if not raw:
+            return
+        p = pathlib.Path(raw)
+        if not p.is_absolute():
+            p = pathlib.Path(self.workdir) / p
+        key = str(p)
+        if key in self.sent_paths:   # дедуп: и внутри стрима, и против финального result
+            return
+        self.sent_paths.add(key)
+        asyncio.create_task(self._deliver(p))
+
+    async def _deliver(self, p: pathlib.Path):
+        try:
+            await self.tg.send_file(self.chat_id, p)
+        except SkipSend:
+            log.info("[%s] send-маркер без реального файла, пропускаю: %s", self.chat_id, p)
+        except Exception as e:
+            log.error("[%s] send_file %s: %s", self.chat_id, p, e)
+            try:
+                await self.tg.send(self.chat_id, sys_text(f"Couldn't send {p.name}: {e}"))
+            except Exception:
+                pass
+
+    def _display_buf(self) -> str:
+        """Буфер без незакрытой метки в хвосте — её не показываем, пока
+        дописывается (закрытые метки уже вырезал _harvest_sends)."""
+        m = _SEND_RE_TAIL.search(self.buf)
+        return self.buf[:m.start()] if m else self.buf
 
     def start(self):
         self._task = asyncio.create_task(self._loop())
@@ -522,10 +666,15 @@ class StreamingMessage:
             return
 
     async def _render(self, final: bool = False):
+        # Сначала вырезаем дописанные метки [[send:]] и отправляем файлы —
+        # в тексте они мелькать не должны.
+        self._harvest_sends()
+
         # Статус (какой тул сейчас крутится) дописываем под текстом, а не только
         # пока текста ещё нет — иначе после первой же дельты дальнейшие вызовы
         # инструментов происходят молча и выглядят как зависание.
-        target = f"{self.buf}\n\n{self.status}" if self.status else self.buf
+        body = self._display_buf()
+        target = f"{body}\n\n{self.status}" if self.status else body
         if not target:
             return
 
@@ -539,7 +688,8 @@ class StreamingMessage:
             self.done_len += len(head)
             self.message_id = None
             self.shown = ""
-            target = f"{self.buf}\n\n{self.status}" if self.status else self.buf
+            body = self._display_buf()
+            target = f"{body}\n\n{self.status}" if self.status else body
 
         if target != self.shown:
             await self._push(target)
@@ -628,6 +778,7 @@ class ChatActor:
         self._debounce: Optional[asyncio.Task] = None
         self._drain: Optional[asyncio.Task] = None
         self._force_fresh = False
+        self._interrupt = False          # /stop попросил оборвать текущий ход
         self._crashes = 0
         self._blocked_until = 0.0
 
@@ -640,6 +791,24 @@ class ChatActor:
         if self._debounce and not self._debounce.done():
             self._debounce.cancel()
         self._debounce = asyncio.create_task(self._after_debounce())
+
+    async def interrupt(self) -> bool:
+        """Обрывает текущий ход. Возвращает False, если обрывать нечего.
+
+        Ставим флаг и гасим процесс: readline в _read_turn разблокируется,
+        увидит флаг и поднимет Interrupted — ход завершится, уже показанный
+        кусок ответа останется, очередь чистится. Сессия восстановится через
+        --resume на следующем сообщении.
+        """
+        # Снимаем ещё не запущенный (в дебаунсе) ввод.
+        self.mailbox.clear()
+        if self._debounce and not self._debounce.done():
+            self._debounce.cancel()
+        if not self.lock.locked():
+            return False
+        self._interrupt = True
+        await self.kill()
+        return True
 
     async def _after_debounce(self):
         try:
@@ -865,39 +1034,56 @@ class ChatActor:
             )
             return
 
-        stream = StreamingMessage(self.tg, self.chat_id) if STREAMING else None
+        self._interrupt = False
+        stream = StreamingMessage(self.tg, self.chat_id, self.workdir) if STREAMING else None
 
-        async with self.sem:
-            answer = await self._turn_once(text, stream)
-
-            # Протухший --resume: чистим привязку и поднимаемся заново.
-            if answer is None:
-                log.warning("[%s] resume не поднялся, стартую чисто", self.chat_id)
-                if stream:
-                    await stream.abort()
-                    stream = StreamingMessage(self.tg, self.chat_id)
-                clear_session(self.chat_id)
-                self._force_fresh = True
-                await self.kill()
+        try:
+            async with self.sem:
                 answer = await self._turn_once(text, stream)
+
+                # Протухший --resume: чистим привязку и поднимаемся заново.
                 if answer is None:
-                    raise RuntimeError("процесс claude не стартует")
+                    log.warning("[%s] resume не поднялся, стартую чисто", self.chat_id)
+                    if stream:
+                        await stream.abort()
+                        stream = StreamingMessage(self.tg, self.chat_id, self.workdir)
+                    clear_session(self.chat_id)
+                    self._force_fresh = True
+                    await self.kill()
+                    answer = await self._turn_once(text, stream)
+                    if answer is None:
+                        raise RuntimeError("процесс claude не стартует")
+        except Interrupted:
+            # Оставляем уже показанный кусок ответа и уже отправленные файлы.
+            if stream:
+                await stream.finish(None)
+            self._interrupt = False
+            self.last_activity = time.monotonic()
+            await self.tg.send(self.chat_id, sys_text("⏹ Stopped. Next message continues the session."))
+            return
 
         self._crashes = 0
         self.last_activity = time.monotonic()
 
         answer, files_to_send = _extract_send_files(answer, self.workdir)
+        already = stream.sent_paths if stream else set()
 
         if stream and (stream.started or stream.message_id):
             await stream.finish(answer)
         else:
             if stream:
                 await stream.abort()
-            await self.tg.send(self.chat_id, answer)
+            # Пустой текст при наличии файла не гоним — это был чистый [[send:]].
+            if answer or not files_to_send:
+                await self.tg.send(self.chat_id, answer)
 
         for path in files_to_send:
+            if str(path) in already:      # уже ушёл по ходу стриминга
+                continue
             try:
                 await self.tg.send_file(self.chat_id, path)
+            except SkipSend:
+                log.info("[%s] send-маркер без реального файла, пропускаю: %s", self.chat_id, path)
             except Exception as e:
                 log.error("[%s] send_file %s: %s", self.chat_id, path, e)
                 await self.tg.send(self.chat_id, sys_text(f"Couldn't send {path.name}: {e}"))
@@ -962,6 +1148,10 @@ class ChatActor:
         while True:
             raw = await self.proc.stdout.readline()
             if not raw:
+                # /stop уронил процесс намеренно — это не краш.
+                if self._interrupt:
+                    await self.kill()
+                    raise Interrupted()
                 await self.kill()
                 # Умер, не дойдя до init, на возобновлённой сессии —
                 # почти наверняка session_id протух.
@@ -1149,6 +1339,7 @@ AWAIT_SYSTEM_S = 300.0
 
 HELP = (
     "Commands:\n"
+    "/stop — interrupt the current turn (keeps what's shown)\n"
     "/context — model, prompt, context usage, state\n"
     "/system — set a system prompt (as the next message)\n"
     "/compact — compact the conversation into a summary and start fresh\n"
@@ -1254,6 +1445,14 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
         if cmd in ("/start", "/help"):
             uid = (msg.get("from") or {}).get("id")
             await tg.send(chat_id, sys_text(f"Ready. chat_id: {chat_id}, user_id: {uid}\n\n{HELP}"))
+            return
+
+        if cmd in ("/stop", "/cancel", "/interrupt"):
+            stopped = await actor.interrupt()
+            await tg.send(
+                chat_id,
+                sys_text("⏹ Interrupting the current turn." if stopped else "Nothing is running."),
+            )
             return
 
         if cmd in ("/clear", "/reset", "/new"):
