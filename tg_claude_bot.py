@@ -86,6 +86,11 @@ def _parse_user_ids(raw: str) -> set:
 
 ALLOWED_USERS = _parse_user_ids(os.environ.get("ALLOWED_USERS", ""))
 
+# Разрешённые группы (chat_id, обычно отрицательные). В такой группе писать боту
+# может любой участник, НО слэш-команды и системный промпт остаются только за
+# ALLOWED_USERS. Вне этого списка действует прежнее правило: только свои юзеры.
+ALLOWED_GROUPS = _parse_user_ids(os.environ.get("ALLOWED_GROUPS", ""))
+
 # Повторно сообщать об отказе одному и тому же человеку в одном чате не чаще
 # этого. С выключенным privacy mode группа иначе получит отказ на каждое
 # сообщение каждого постороннего — бот сам станет спамером. 0 = отвечать всегда.
@@ -133,6 +138,20 @@ IDLE_TIMEOUT_S = float(os.environ.get("IDLE_TIMEOUT_S", "900"))
 
 # Потолок на один ход. Дольше — считаем, что процесс завис.
 TURN_TIMEOUT_S = float(os.environ.get("TURN_TIMEOUT_S", "600"))
+
+# Фоновая задача (Bash run_in_background) по завершении сама переинвокает агента
+# — он выдаёт ещё один ход с результатом уже ПОСЛЕ того, как исходный ход закрылся
+# событием result. Чтобы этот автономный ход не потерялся, после хода с фоновой
+# задачей держим процесс живым и дочитываем stdout ещё столько секунд.
+BG_KEEPALIVE_S = float(os.environ.get("BG_KEEPALIVE_S", "1800"))
+# После доставки автономного ответа, не породившего новых фоновых задач, ждём
+# ещё столько на «соседние» завершения — и гасим, не держа процесс всё окно.
+BG_TAIL_GRACE_S = float(os.environ.get("BG_TAIL_GRACE_S", "120"))
+# Рубильник хвостового ридера. ВЫКЛ по умолчанию: он дочитывает stdout после
+# ответа, но при неудачном тайминге недочитанный автономный сегмент остаётся в
+# пайпе и уезжает в следующий ход — бот «отвечает на прошлое сообщение». Пока
+# не вычищен этот рассинхрон, держим выключенным (поведение как до правки).
+BG_TAIL_READER = os.environ.get("BG_TAIL_READER", "0") not in ("0", "false", "no")
 
 # После перезапуска скрипта возобновляем сессию только если пауза меньше этого.
 # Дольше — начинаем чисто: старый контекст всё равно раздут, а история диалога
@@ -214,6 +233,20 @@ def _db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN system_prompt TEXT")
     if "workdir" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN workdir TEXT")
+    if "paused" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+    # Отложенные задачи: в нужный момент промпт впрыскивается в актор чата,
+    # как обычное сообщение — тот же ход, стриминг и --resume.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scheduled ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "chat_id INTEGER NOT NULL, "
+        "run_at REAL NOT NULL, "
+        "prompt TEXT NOT NULL, "
+        "repeat_secs REAL NOT NULL DEFAULT 0, "
+        "created_at REAL NOT NULL, "
+        "created_by INTEGER)"
+    )
     return conn
 
 
@@ -292,6 +325,31 @@ def load_workdir(chat_id: int) -> Optional[str]:
         return None
 
 
+def save_paused(chat_id: int, paused: bool):
+    """Пауза чата переживает /clear, /compact и перезапуск скрипта."""
+    try:
+        with _db() as c:
+            c.execute(
+                "INSERT INTO sessions (chat_id, paused, ts) VALUES (?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET paused=excluded.paused",
+                (chat_id, 1 if paused else 0, time.time()),
+            )
+    except Exception as e:
+        log.error("save_paused: %s", e)
+
+
+def load_paused(chat_id: int) -> bool:
+    try:
+        with _db() as c:
+            row = c.execute(
+                "SELECT paused FROM sessions WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+        return bool(row[0]) if row and row[0] else False
+    except Exception as e:
+        log.error("load_paused: %s", e)
+        return False
+
+
 def resolve_workdir(raw: str) -> Tuple[Optional[str], str]:
     """
     Разбирает аргумент /cd. Возвращает (путь, причина отказа).
@@ -361,8 +419,150 @@ def clear_session(chat_id: int):
 
 
 # --------------------------------------------------------------------------
+# Отложенные задачи (крон с промптом)
+# --------------------------------------------------------------------------
+
+SCHEDULER_TICK_S = 15.0            # как часто проверяем очередь
+MAX_TASKS_PER_CHAT = 50           # чтоб один чат не забил планировщик
+
+_DUR_RE = re.compile(r"(\d+)\s*([smhdw])", re.I)
+_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def parse_duration(s: str) -> Optional[float]:
+    """'30m', '2h', '1h30m', '1d' -> секунды. None, если не разобрать."""
+    s = s.strip().lower()
+    if not s:
+        return None
+    total = 0
+    pos = 0
+    for m in _DUR_RE.finditer(s):
+        if m.start() != pos:      # мусор между числами — не наш формат
+            return None
+        total += int(m.group(1)) * _UNIT_S[m.group(2)]
+        pos = m.end()
+    if pos != len(s) or total <= 0:
+        return None
+    return float(total)
+
+
+def next_time_at(hhmm: str) -> Optional[float]:
+    """'18:00' -> ближайший локальный момент с этим временем (сегодня/завтра)."""
+    try:
+        hh, mm = hhmm.split(":")
+        hh, mm = int(hh), int(mm)
+    except Exception:
+        return None
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        return None
+    now = time.time()
+    lt = time.localtime(now)
+    # isdst=-1 — mktime сам разберётся с переводом часов
+    t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+    if t <= now:
+        t += 86400
+    return t
+
+
+def fmt_when(run_at: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(run_at))
+
+
+def add_task(chat_id: int, run_at: float, prompt: str,
+             repeat_secs: float, created_by: Optional[int]) -> Optional[int]:
+    try:
+        with _db() as c:
+            n = c.execute(
+                "SELECT COUNT(*) FROM scheduled WHERE chat_id=?", (chat_id,)
+            ).fetchone()[0]
+            if n >= MAX_TASKS_PER_CHAT:
+                return None
+            cur = c.execute(
+                "INSERT INTO scheduled (chat_id, run_at, prompt, repeat_secs, created_at, created_by) "
+                "VALUES (?,?,?,?,?,?)",
+                (chat_id, run_at, prompt, repeat_secs, time.time(), created_by),
+            )
+            return cur.lastrowid
+    except Exception as e:
+        log.error("add_task: %s", e)
+        return None
+
+
+def list_tasks(chat_id: int) -> List[Tuple]:
+    try:
+        with _db() as c:
+            return c.execute(
+                "SELECT id, run_at, prompt, repeat_secs FROM scheduled "
+                "WHERE chat_id=? ORDER BY run_at",
+                (chat_id,),
+            ).fetchall()
+    except Exception as e:
+        log.error("list_tasks: %s", e)
+        return []
+
+
+def cancel_task(chat_id: int, task_id: int) -> bool:
+    """Удаляет задачу только в пределах своего чата (чужую не тронуть)."""
+    try:
+        with _db() as c:
+            cur = c.execute(
+                "DELETE FROM scheduled WHERE id=? AND chat_id=?", (task_id, chat_id)
+            )
+            return cur.rowcount > 0
+    except Exception as e:
+        log.error("cancel_task: %s", e)
+        return False
+
+
+def due_tasks(now: float) -> List[Tuple]:
+    try:
+        with _db() as c:
+            return c.execute(
+                "SELECT id, chat_id, run_at, prompt, repeat_secs FROM scheduled "
+                "WHERE run_at<=? ORDER BY run_at",
+                (now,),
+            ).fetchall()
+    except Exception as e:
+        log.error("due_tasks: %s", e)
+        return []
+
+
+def _settle_task(task_id: int, run_at: float, repeat_secs: float, now: float):
+    """После срабатывания: разовую удаляем, повторную двигаем в будущее.
+    Двигаем сразу за now (а не на +repeat от старого run_at), чтобы после
+    простоя моста не выстрелить пачкой пропущенных срабатываний."""
+    try:
+        with _db() as c:
+            if repeat_secs > 0:
+                nxt = run_at + repeat_secs
+                while nxt <= now:
+                    nxt += repeat_secs
+                c.execute("UPDATE scheduled SET run_at=? WHERE id=?", (nxt, task_id))
+            else:
+                c.execute("DELETE FROM scheduled WHERE id=?", (task_id,))
+    except Exception as e:
+        log.error("_settle_task: %s", e)
+
+
+# --------------------------------------------------------------------------
 # Тонкий клиент Telegram (long polling — белый IP не нужен)
 # --------------------------------------------------------------------------
+
+_BOLD_DBL_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_BOLD_UNDERSCORE_RE = re.compile(r"__(.+?)__", re.DOTALL)
+
+
+def _normalize_md(text: str) -> str:
+    """Модель по системному промпту должна писать *bold* (легаси-Markdown
+    Telegram), но иногда сваливается в привычный GFM **bold**/__bold__.
+    Двойной маркер telegram трактует как пустую сущность и роняет парсинг
+    всего сообщения целиком — тогда call_md откатывается в plain text, и
+    юзер видит сырые звёздочки без форматирования вообще. Сводим двойные
+    маркеры к одинарным до отправки, чтобы разметка выживала в любом случае."""
+    text = _BOLD_DBL_RE.sub(r"*\1*", text)
+    text = _BOLD_UNDERSCORE_RE.sub(r"*\1*", text)
+    return text
+
 
 class Telegram:
     def __init__(self, token: str, session: aiohttp.ClientSession):
@@ -381,6 +581,8 @@ class Telegram:
     async def call_md(self, method: str, **params):
         """Как call(), но рендерит Markdown и откатывается в plain text,
         если разметка не закрыта (например, посреди стриминга дельт)."""
+        if "text" in params:
+            params["text"] = _normalize_md(params["text"])
         try:
             return await self.call(method, parse_mode="Markdown", **params)
         except RuntimeError as e:
@@ -757,6 +959,8 @@ class ChatActor:
         self.model: str = load_model(chat_id) or DEFAULT_MODEL
         self.system_prompt: Optional[str] = load_system_prompt(chat_id)
         self.workdir: str = load_workdir(chat_id) or CLAUDE_WORKDIR
+        # Пауза: бот не реагирует на обычные сообщения этого чата, пока /resume.
+        self.paused: bool = load_paused(chat_id)
 
         # Режим «следующее сообщение — это системный промпт».
         self.awaiting_system: float = 0.0
@@ -782,6 +986,14 @@ class ChatActor:
         self._crashes = 0
         self._blocked_until = 0.0
 
+        # «Хвостовой» ридер: дочитывает автономные ходы (переинвок фоновой задачи)
+        # после того, как обычный ход закрылся. _bg_deadline — до какого момента
+        # держим процесс живым в ожидании фонового ответа.
+        self._tail: Optional[asyncio.Task] = None
+        self._tail_state = "idle"        # "idle" ждёт первую строку сегмента / "reading" внутри сегмента
+        self._preempt = False            # новый ход просит хвост уступить stdout
+        self._bg_deadline = 0.0          # monotonic; пока now < него — не гасим и держим хвост
+
     # -- вход ---------------------------------------------------------------
 
     async def submit(self, text: str):
@@ -804,10 +1016,13 @@ class ChatActor:
         self.mailbox.clear()
         if self._debounce and not self._debounce.done():
             self._debounce.cancel()
-        if not self.lock.locked():
+        # /stop прекращает и ожидание фонового ответа.
+        self._bg_deadline = 0.0
+        tail_running = bool(self._tail and not self._tail.done())
+        if not self.lock.locked() and not tail_running:
             return False
         self._interrupt = True
-        await self.kill()
+        await self.kill()          # заодно гасит хвостовой ридер
         return True
 
     async def _after_debounce(self):
@@ -823,6 +1038,8 @@ class ChatActor:
 
     async def _drain_loop(self):
         async with self.lock:
+            # Хвостовой ридер держит stdout — заберём его себе, пока идёт ход.
+            await self._preempt_tail()
             while self.mailbox:
                 merged = "\n".join(self.mailbox).strip()
                 self.mailbox.clear()
@@ -847,6 +1064,94 @@ class ChatActor:
                         sys_text(f"⚠️ Session crashed: {e}\nNext message will start a fresh one."),
                     )
                     break
+        # Ход оставил висящую фоновую задачу — слушаем её автономный ответ.
+        self._maybe_start_tail()
+
+    # -- хвостовой ридer: автономные ходы после result ----------------------
+
+    def _maybe_start_tail(self):
+        """Поднимает хвостовой ридер, если после хода осталась висеть фоновая
+        задача (до _bg_deadline) и процесс жив."""
+        if not BG_TAIL_READER:
+            return
+        if self._tail and not self._tail.done():
+            return
+        if not self.alive():
+            return
+        if time.monotonic() >= self._bg_deadline:
+            return
+        self._tail = asyncio.create_task(self._tail_reader())
+
+    async def _preempt_tail(self):
+        """Забирает stdout у хвостового ридера перед обычным ходом: два читателя
+        одного пайпа недопустимы. Если ридер ждёт первую строку (idle) — рвём
+        сразу (данные не теряются, буфер stdout сохраняется); если он в середине
+        автономного сегмента — даём его дочитать, но ограниченно."""
+        t = self._tail
+        if not t or t.done():
+            self._tail = None
+            return
+        self._preempt = True
+        try:
+            if self._tail_state == "idle":
+                t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(t), timeout=45)
+            except asyncio.TimeoutError:
+                t.cancel()                       # застрял в длинном сегменте — рвём
+                try:
+                    await t
+                except BaseException:
+                    pass
+            except BaseException:
+                pass
+        finally:
+            self._tail = None
+            self._preempt = False
+            self._tail_state = "idle"
+
+    async def _tail_reader(self):
+        """Пока процесс жив и есть незакрытая фоновая задача — читаем stdout и
+        отдаём каждый автономный ход (переинвок по завершению фона) в чат новым
+        сообщением. Между сегментами висим на readline, ничего не тратя."""
+        log.info("[%s] tail-reader: жду автономный ответ (~%.0fs)",
+                 self.chat_id, max(0.0, self._bg_deadline - time.monotonic()))
+        delivered = 0
+        try:
+            while self.alive() and not self._preempt and time.monotonic() < self._bg_deadline:
+                stream = StreamingMessage(self.tg, self.chat_id, self.workdir) if STREAMING else None
+                if stream:
+                    stream.start()
+                self._tail_state = "idle"
+                before = self._bg_deadline
+                try:
+                    answer = await self._read_turn(
+                        stream,
+                        on_activity=lambda: setattr(self, "_tail_state", "reading"),
+                        crash_on_eof=False,
+                    )
+                except asyncio.CancelledError:
+                    if stream:
+                        await stream.abort()
+                    raise
+                except (Interrupted, StaleSession, RuntimeError):
+                    # процесс закрыл stdout / умер — просто выходим, не крашим.
+                    if stream:
+                        await stream.abort()
+                    return
+                # Полный сегмент получили — отдаём его целиком (даже если тем
+                # временем пришёл _preempt: терять готовый ответ нельзя).
+                await self._deliver_segment(answer, stream)
+                delivered += 1
+                self.last_activity = time.monotonic()
+                log.info("[%s] tail-reader: автономный ответ доставлен (#%d)", self.chat_id, delivered)
+                # Ход не породил новых фоновых задач (_bg_deadline не сдвинулся) —
+                # значит это, вероятно, финал: ждём ещё чуть-чуть на соседние
+                # завершения и сворачиваемся, не удерживая процесс всё окно.
+                if self._bg_deadline == before:
+                    self._bg_deadline = min(self._bg_deadline, time.monotonic() + BG_TAIL_GRACE_S)
+        finally:
+            self._tail_state = "idle"
 
     # -- процесс ------------------------------------------------------------
 
@@ -908,6 +1213,12 @@ class ChatActor:
             log.debug("[%s] stderr: %s", self.chat_id, line.decode(errors="replace").rstrip())
 
     async def kill(self):
+        # Гасим хвостовой ридер — но не сам себя, если kill вызван из него
+        # (его собственный _read_turn на EOF зовёт kill).
+        t = self._tail
+        if t and t is not asyncio.current_task() and not t.done():
+            self._tail = None
+            t.cancel()
         proc, self.proc = self.proc, None
         if proc and proc.returncode is None:
             try:
@@ -934,6 +1245,7 @@ class ChatActor:
         self.mailbox.clear()
         self._crashes = 0
         self._blocked_until = 0.0
+        self._bg_deadline = 0.0
 
     async def set_system_prompt(self, prompt: Optional[str]) -> str:
         """
@@ -1002,6 +1314,7 @@ class ChatActor:
         )
 
         async with self.lock:          # не влезаем в середину чужого хода
+            await self._preempt_tail()  # stdout нужен нам, а не хвостовому ридеру
             async with self.sem:
                 summary = await self._turn_once(prompt)
 
@@ -1065,6 +1378,13 @@ class ChatActor:
         self._crashes = 0
         self.last_activity = time.monotonic()
 
+        await self._deliver_segment(answer, stream)
+        await self._maybe_warn_context()
+
+    async def _deliver_segment(self, answer: str, stream: Optional["StreamingMessage"]):
+        """Отдаёт готовый сегмент (ответ хода) в чат: финализирует стрим-сообщение
+        и досылает файлы из меток [[send:]]. Общий путь для обычного и для
+        автономного (фонового) хода."""
         answer, files_to_send = _extract_send_files(answer, self.workdir)
         already = stream.sent_paths if stream else set()
 
@@ -1087,8 +1407,6 @@ class ChatActor:
             except Exception as e:
                 log.error("[%s] send_file %s: %s", self.chat_id, path, e)
                 await self.tg.send(self.chat_id, sys_text(f"Couldn't send {path.name}: {e}"))
-
-        await self._maybe_warn_context()
 
     async def _turn_once(self, text: str, stream: Optional["StreamingMessage"] = None) -> Optional[str]:
         """Один ход. None = сессия не поднялась (кандидат на протухший resume)."""
@@ -1139,11 +1457,23 @@ class ChatActor:
         except asyncio.CancelledError:
             return
 
-    async def _read_turn(self, stream: Optional["StreamingMessage"] = None) -> str:
-        """Читает stream-json до события result. Возвращает текст ответа."""
+    async def _read_turn(
+        self,
+        stream: Optional["StreamingMessage"] = None,
+        on_activity=None,
+        crash_on_eof: bool = True,
+    ) -> str:
+        """Читает stream-json до события result. Возвращает текст ответа.
+
+        on_activity: колбэк, вызывается один раз при первой строке сегмента
+            (хвостовому ридеру — отметить, что он уже внутри сегмента).
+        crash_on_eof: считать закрытие stdout крашем. Для хвостового ридера
+            False — там EOF это штатное завершение процесса, не краш.
+        """
         assert self.proc and self.proc.stdout
         collected: List[str] = []
         got_init = False
+        seen_line = False
 
         while True:
             raw = await self.proc.stdout.readline()
@@ -1157,12 +1487,20 @@ class ChatActor:
                 # почти наверняка session_id протух.
                 if self.resumed and not got_init:
                     raise StaleSession()
-                self._note_crash()
+                if crash_on_eof:
+                    self._note_crash()
                 raise RuntimeError("процесс claude закрыл stdout")
 
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
+            if not seen_line:
+                seen_line = True
+                if on_activity:
+                    try:
+                        on_activity()
+                    except Exception:
+                        pass
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
@@ -1190,8 +1528,16 @@ class ChatActor:
             elif etype == "assistant":
                 message = ev.get("message", {})
                 for block in message.get("content", []) or []:
-                    if isinstance(block, dict) and block.get("type") == "text":
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
                         collected.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use" and BG_TAIL_READER and self._is_background_tool(block):
+                        # Модель запустила фоновую задачу: по её завершению агент
+                        # сам переинвокнется отдельным ходом ПОСЛЕ result. Держим
+                        # процесс живым и включаем хвостовой ридер на это окно.
+                        self._bg_deadline = time.monotonic() + BG_KEEPALIVE_S
+                        log.info("[%s] замечена фоновая задача, keepalive до +%.0fs", self.chat_id, BG_KEEPALIVE_S)
                 usage = message.get("usage")
                 if usage:
                     self._last_msg_usage = usage
@@ -1204,6 +1550,14 @@ class ChatActor:
                 if isinstance(final, str) and final.strip():
                     return final
                 return "\n".join(collected)
+
+    @staticmethod
+    def _is_background_tool(block: dict) -> bool:
+        """tool_use-блок — это Bash, запущенный в фоне (run_in_background)."""
+        if block.get("name") != "Bash":
+            return False
+        inp = block.get("input")
+        return isinstance(inp, dict) and bool(inp.get("run_in_background"))
 
     @staticmethod
     def _feed_stream(stream: "StreamingMessage", ev: dict):
@@ -1269,7 +1623,7 @@ class ChatActor:
             )
 
     def context_report(self) -> str:
-        state = "generating" if self.lock.locked() else ("running" if self.alive() else "stopped")
+        state = "paused" if self.paused else ("generating" if self.lock.locked() else ("running" if self.alive() else "stopped"))
         if not self.context_tokens:
             body = "Context: no data yet (no turns in this session)"
         else:
@@ -1322,9 +1676,35 @@ class Supervisor:
             await asyncio.sleep(30)
             now = time.monotonic()
             for a in list(self.actors.values()):
-                if a.alive() and not a.lock.locked() and now - a.last_activity > IDLE_TIMEOUT_S:
+                if (a.alive() and not a.lock.locked()
+                        and now - a.last_activity > IDLE_TIMEOUT_S
+                        and now >= a._bg_deadline):     # ждём автономный ответ фона — не гасим
                     log.info("[%s] простой %.0f c — гашу процесс", a.chat_id, now - a.last_activity)
                     await a.kill()
+
+    async def scheduler(self):
+        """Крон с промптом: в срок впрыскивает задачу в актор чата как обычное
+        сообщение — тот же ход, стриминг ответа и продолжение сессии."""
+        while True:
+            await asyncio.sleep(SCHEDULER_TICK_S)
+            now = time.time()
+            for task_id, chat_id, run_at, prompt, repeat_secs in due_tasks(now):
+                # Сначала фиксируем (удаляем/двигаем), потом отправляем — так
+                # перезапуск моста в момент выстрела не продублирует задачу.
+                _settle_task(task_id, run_at, repeat_secs, now)
+                try:
+                    actor = self.actor(chat_id)
+                    fire = (
+                        f"⏰ Запланированная задача #{task_id} — время выполнить её сейчас:\n"
+                        f"{prompt}"
+                    )
+                    await self.tg.send(
+                        chat_id, sys_text(f"⏰ Запускаю задачу #{task_id}…")
+                    )
+                    await actor.submit(fire)
+                    log.info("[%s] задача #%s сработала", chat_id, task_id)
+                except Exception as e:
+                    log.error("[%s] задача #%s не запустилась: %s", chat_id, task_id, e)
 
     async def shutdown(self):
         for a in list(self.actors.values()):
@@ -1337,6 +1717,14 @@ class Supervisor:
 
 AWAIT_SYSTEM_S = 300.0
 
+SCHED_USAGE = (
+    "Schedule a task (the bot runs the prompt itself at that time):\n"
+    "/in 45m <task> — once, after an interval (30m, 2h, 1h30m, 1d)\n"
+    "/at 18:30 <task> — once, at the next HH:MM\n"
+    "/every 2h <task> — repeat on an interval\n"
+    "/tasks — list · /tasks del <id> — remove"
+)
+
 HELP = (
     "Commands:\n"
     "/stop — interrupt the current turn (keeps what's shown)\n"
@@ -1344,8 +1732,10 @@ HELP = (
     "/system — set a system prompt (as the next message)\n"
     "/compact — compact the conversation into a summary and start fresh\n"
     "/clear — reset context completely\n"
+    "/pause — stop reacting to messages here · /resume — start again\n"
     "/model [opus|sonnet|haiku] — switch model (resets context)\n"
     "/cd [path] — working directory (resets context)\n"
+    "/in · /at · /every · /tasks — schedule tasks (the bot runs them for you)\n"
     "/help — this message"
 )
 
@@ -1393,25 +1783,41 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
         return
 
     # Проверка до создания актора: посторонний не должен поднимать процесс.
-    if ALLOWED_USERS:
-        user_id = (msg.get("from") or {}).get("id")
-        if user_id not in ALLOWED_USERS:
-            # Отвечаем реплаем на само сообщение: в группе иначе непонятно,
-            # что именно проигнорировано. Повторы гасит пауза.
-            notify = _should_notify_denial(chat_id, user_id)
-            log.log(
-                logging.WARNING if notify else logging.DEBUG,
-                "отказ: user_id=%s chat_id=%s", user_id, chat_id,
+    user_id = (msg.get("from") or {}).get("id")
+    chat_type = msg.get("chat", {}).get("type")
+    is_group = chat_type in ("group", "supergroup")
+
+    # Свой юзер (в whitelist'е, либо whitelist пуст = открыто всем) может всё.
+    user_ok = (not ALLOWED_USERS) or (user_id in ALLOWED_USERS)
+    # В разрешённой группе писать боту может любой участник.
+    group_ok = is_group and chat_id in ALLOWED_GROUPS
+
+    if not (user_ok or group_ok):
+        # Отвечаем реплаем на само сообщение: в группе иначе непонятно,
+        # что именно проигнорировано. Повторы гасит пауза.
+        notify = _should_notify_denial(chat_id, user_id)
+        log.log(
+            logging.WARNING if notify else logging.DEBUG,
+            "отказ: user_id=%s chat_id=%s", user_id, chat_id,
+        )
+        if notify:
+            await tg.send(
+                chat_id,
+                sys_text(f"Message ignored: no access.\nuser_id: {user_id}"),
+                reply_to=msg.get("message_id"),
             )
-            if notify:
-                await tg.send(
-                    chat_id,
-                    sys_text(f"Message ignored: no access.\nuser_id: {user_id}"),
-                    reply_to=msg.get("message_id"),
-                )
-            return
+        return
+
+    # Управлять ботом (слэш-команды, системный промпт) — только whitelist.
+    # Остальные участники разрешённой группы могут лишь писать боту.
+    privileged = user_ok
 
     actor = sup.actor(chat_id)
+
+    # Пауза: чат заглушён. Пропускаем только команды от своих (чтобы /resume и
+    # прочие настройки работали) — обычные сообщения и вложения молча игнорируем.
+    if actor.paused and not (privileged and text.startswith("/")):
+        return
 
     if attachment:
         file_id, filename = attachment
@@ -1440,6 +1846,15 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
         return
 
     if text.startswith("/"):
+        # Команды — только whitelist. Остальные в группе просто пишут боту.
+        if not privileged:
+            if _should_notify_denial(chat_id, user_id):
+                await tg.send(
+                    chat_id,
+                    sys_text("Commands are for admins only — just message the bot normally."),
+                    reply_to=msg.get("message_id"),
+                )
+            return
         cmd = text.split()[0].split("@")[0].lower()
 
         if cmd in ("/start", "/help"):
@@ -1453,6 +1868,78 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
                 chat_id,
                 sys_text("⏹ Interrupting the current turn." if stopped else "Nothing is running."),
             )
+            return
+
+        if cmd in ("/pause", "/mute", "/sleep"):
+            actor.paused = True
+            save_paused(chat_id, True)
+            await tg.send(
+                chat_id,
+                sys_text("⏸ Paused. I'll ignore messages here until /resume. Commands still work."),
+            )
+            return
+
+        if cmd in ("/resume", "/unmute", "/wake"):
+            was = actor.paused
+            actor.paused = False
+            save_paused(chat_id, False)
+            await tg.send(
+                chat_id,
+                sys_text("▶️ Resumed — listening again." if was else "Wasn't paused."),
+            )
+            return
+
+        if cmd in ("/in", "/at", "/every"):
+            parts = text.split(maxsplit=2)
+            if len(parts) < 3:
+                await tg.send(chat_id, sys_text(SCHED_USAGE))
+                return
+            spec, prompt = parts[1], parts[2].strip()
+            repeat = 0.0
+            if cmd == "/at":
+                run_at = next_time_at(spec)
+                if run_at is None:
+                    await tg.send(chat_id, sys_text("Bad time. Use HH:MM, e.g. /at 18:30 <task>."))
+                    return
+            else:
+                secs = parse_duration(spec)
+                if secs is None:
+                    await tg.send(chat_id, sys_text("Bad interval. Use 30m, 2h, 1h30m, 1d, e.g. /in 45m <task>."))
+                    return
+                run_at = time.time() + secs
+                if cmd == "/every":
+                    repeat = secs
+            uid = (msg.get("from") or {}).get("id")
+            tid = add_task(chat_id, run_at, prompt, repeat, uid)
+            if tid is None:
+                await tg.send(chat_id, sys_text(f"Too many scheduled tasks (limit {MAX_TASKS_PER_CHAT}). Remove some with /tasks del <id>."))
+                return
+            extra = f", every {spec}" if repeat else ""
+            await tg.send(chat_id, sys_text(f"⏰ Task #{tid} scheduled for {fmt_when(run_at)}{extra}."))
+            return
+
+        if cmd in ("/tasks", "/jobs", "/sched"):
+            parts = text.split()
+            if len(parts) >= 3 and parts[1].lower() in ("del", "cancel", "rm", "remove"):
+                try:
+                    tid = int(parts[2])
+                except ValueError:
+                    await tg.send(chat_id, sys_text("Usage: /tasks del <id>"))
+                    return
+                ok = cancel_task(chat_id, tid)
+                await tg.send(chat_id, sys_text(f"Task #{tid} removed." if ok else f"No task #{tid} in this chat."))
+                return
+            rows = list_tasks(chat_id)
+            if not rows:
+                await tg.send(chat_id, sys_text("No scheduled tasks.\n\n" + SCHED_USAGE))
+                return
+            lines = ["⏰ Scheduled tasks:"]
+            for tid, run_at, prompt, repeat_secs in rows:
+                rep = f" (every {int(repeat_secs)}s)" if repeat_secs else ""
+                short = prompt if len(prompt) <= 60 else prompt[:57] + "…"
+                lines.append(f"#{tid} · {fmt_when(run_at)}{rep} · {short}")
+            lines.append("\nRemove: /tasks del <id>")
+            await tg.send(chat_id, sys_text("\n".join(lines)))
             return
 
         if cmd in ("/clear", "/reset", "/new"):
@@ -1546,8 +2033,9 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
         await tg.send(chat_id, sys_text(f"Unknown command.\n\n{HELP}"))
         return
 
-    # Ждём системный промпт следующим сообщением (окно 5 минут).
-    if actor.awaiting_system:
+    # Ждём системный промпт следующим сообщением (окно 5 минут). Ловим его только
+    # от whitelist'а: в группе чужое сообщение не должно стать системным промптом.
+    if actor.awaiting_system and privileged:
         if time.monotonic() - actor.awaiting_system < AWAIT_SYSTEM_S:
             await tg.send(chat_id, sys_text(await actor.set_system_prompt(text)))
             return
@@ -1667,16 +2155,18 @@ async def main():
         tg = Telegram(BOT_TOKEN, session)
         me = await tg.call("getMe")
         log.info(
-            "бот @%s готов | workdir=%s | db=%s | стриминг=%s | доступ: %s",
+            "бот @%s готов | workdir=%s | db=%s | стриминг=%s | доступ: %s | группы: %s",
             me.get("username"), CLAUDE_WORKDIR, STATE_DB,
             "вкл" if STREAMING else "выкл",
             f"{len(ALLOWED_USERS)} user_id" if ALLOWED_USERS else "открыт всем",
+            f"{len(ALLOWED_GROUPS)} разрешено" if ALLOWED_GROUPS else "нет",
         )
 
         sup = Supervisor(tg)
         tasks = [
             asyncio.create_task(poll(sup, tg, stop)),
             asyncio.create_task(sup.reaper()),
+            asyncio.create_task(sup.scheduler()),
         ]
         await stop.wait()
         log.info("останавливаюсь…")

@@ -13,9 +13,10 @@ venv/
 env/
 *.egg-info/
 
-# Runtime logs and restart helper
+# Runtime logs and local launch/restart helpers (machine-specific abs paths)
 *.log
 restart_bridge.ps1
+start_bridge.bat
 
 # Incoming Telegram attachments (user data)
 telegram-uploads/
