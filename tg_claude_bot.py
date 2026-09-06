@@ -1792,6 +1792,18 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     # В разрешённой группе писать боту может любой участник.
     group_ok = is_group and chat_id in ALLOWED_GROUPS
 
+    # Управлять ботом (слэш-команды, системный промпт) — только whitelist.
+    # Остальные участники разрешённой группы могут лишь писать боту.
+    privileged = user_ok
+
+    # Пауза: чат полностью заглушён — молчим на всё, включая отказы чужим (иначе
+    # пауза не «не отвлекает»). Пропускаем только команды от своих, чтобы /resume
+    # и настройки работали. Состояние читаем без поднятия процесса.
+    existing = sup.actors.get(chat_id)
+    paused = existing.paused if existing else load_paused(chat_id)
+    if paused and not (privileged and text.startswith("/")):
+        return
+
     if not (user_ok or group_ok):
         # Отвечаем реплаем на само сообщение: в группе иначе непонятно,
         # что именно проигнорировано. Повторы гасит пауза.
@@ -1808,16 +1820,7 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
             )
         return
 
-    # Управлять ботом (слэш-команды, системный промпт) — только whitelist.
-    # Остальные участники разрешённой группы могут лишь писать боту.
-    privileged = user_ok
-
     actor = sup.actor(chat_id)
-
-    # Пауза: чат заглушён. Пропускаем только команды от своих (чтобы /resume и
-    # прочие настройки работали) — обычные сообщения и вложения молча игнорируем.
-    if actor.paused and not (privileged and text.startswith("/")):
-        return
 
     if attachment:
         file_id, filename = attachment
