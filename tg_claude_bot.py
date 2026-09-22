@@ -235,6 +235,24 @@ def _db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN workdir TEXT")
     if "paused" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+    # Изоляция по топикам форумных супергрупп: ключ становится составным
+    # (chat_id, thread_id). Старые строки — это нефорумные чаты, им thread_id=0.
+    # PRIMARY KEY у sessions поменять ALTER'ом нельзя, поэтому пересобираем таблицу.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "thread_id" not in cols:
+        conn.executescript(
+            "CREATE TABLE sessions_new ("
+            "chat_id INTEGER NOT NULL, "
+            "thread_id INTEGER NOT NULL DEFAULT 0, "
+            "session_id TEXT, ts REAL, model TEXT, system_prompt TEXT, workdir TEXT, "
+            "paused INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (chat_id, thread_id));"
+            "INSERT INTO sessions_new "
+            "(chat_id, thread_id, session_id, ts, model, system_prompt, workdir, paused) "
+            "SELECT chat_id, 0, session_id, ts, model, system_prompt, workdir, paused FROM sessions;"
+            "DROP TABLE sessions;"
+            "ALTER TABLE sessions_new RENAME TO sessions;"
+        )
     # Отложенные задачи: в нужный момент промпт впрыскивается в актор чата,
     # как обычное сообщение — тот же ход, стриминг и --resume.
     conn.execute(
@@ -247,27 +265,31 @@ def _db() -> sqlite3.Connection:
         "created_at REAL NOT NULL, "
         "created_by INTEGER)"
     )
+    scols = {r[1] for r in conn.execute("PRAGMA table_info(scheduled)")}
+    if "thread_id" not in scols:
+        conn.execute("ALTER TABLE scheduled ADD COLUMN thread_id INTEGER NOT NULL DEFAULT 0")
     return conn
 
 
-def save_system_prompt(chat_id: int, prompt: Optional[str]):
+def save_system_prompt(chat_id: int, prompt: Optional[str], thread_id: int = 0):
     """Живёт дольше сессий: подставляется в каждый новый процесс."""
     try:
         with _db() as c:
             c.execute(
-                "INSERT INTO sessions (chat_id, system_prompt, ts) VALUES (?,?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET system_prompt=excluded.system_prompt",
-                (chat_id, prompt, time.time()),
+                "INSERT INTO sessions (chat_id, thread_id, system_prompt, ts) VALUES (?,?,?,?) "
+                "ON CONFLICT(chat_id, thread_id) DO UPDATE SET system_prompt=excluded.system_prompt",
+                (chat_id, thread_id, prompt, time.time()),
             )
     except Exception as e:
         log.error("save_system_prompt: %s", e)
 
 
-def load_system_prompt(chat_id: int) -> Optional[str]:
+def load_system_prompt(chat_id: int, thread_id: int = 0) -> Optional[str]:
     try:
         with _db() as c:
             row = c.execute(
-                "SELECT system_prompt FROM sessions WHERE chat_id=?", (chat_id,)
+                "SELECT system_prompt FROM sessions WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id),
             ).fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:
@@ -275,24 +297,25 @@ def load_system_prompt(chat_id: int) -> Optional[str]:
         return None
 
 
-def save_model(chat_id: int, model: str):
+def save_model(chat_id: int, model: str, thread_id: int = 0):
     """Выбор модели переживает сброс сессии и перезапуск скрипта."""
     try:
         with _db() as c:
             c.execute(
-                "INSERT INTO sessions (chat_id, model, ts) VALUES (?,?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET model=excluded.model",
-                (chat_id, model, time.time()),
+                "INSERT INTO sessions (chat_id, thread_id, model, ts) VALUES (?,?,?,?) "
+                "ON CONFLICT(chat_id, thread_id) DO UPDATE SET model=excluded.model",
+                (chat_id, thread_id, model, time.time()),
             )
     except Exception as e:
         log.error("save_model: %s", e)
 
 
-def load_model(chat_id: int) -> Optional[str]:
+def load_model(chat_id: int, thread_id: int = 0) -> Optional[str]:
     try:
         with _db() as c:
             row = c.execute(
-                "SELECT model FROM sessions WHERE chat_id=?", (chat_id,)
+                "SELECT model FROM sessions WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id),
             ).fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:
@@ -300,24 +323,25 @@ def load_model(chat_id: int) -> Optional[str]:
         return None
 
 
-def save_workdir(chat_id: int, workdir: str):
+def save_workdir(chat_id: int, workdir: str, thread_id: int = 0):
     """Каталог переживает /clear, /compact и перезапуск скрипта."""
     try:
         with _db() as c:
             c.execute(
-                "INSERT INTO sessions (chat_id, workdir, ts) VALUES (?,?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET workdir=excluded.workdir",
-                (chat_id, workdir, time.time()),
+                "INSERT INTO sessions (chat_id, thread_id, workdir, ts) VALUES (?,?,?,?) "
+                "ON CONFLICT(chat_id, thread_id) DO UPDATE SET workdir=excluded.workdir",
+                (chat_id, thread_id, workdir, time.time()),
             )
     except Exception as e:
         log.error("save_workdir: %s", e)
 
 
-def load_workdir(chat_id: int) -> Optional[str]:
+def load_workdir(chat_id: int, thread_id: int = 0) -> Optional[str]:
     try:
         with _db() as c:
             row = c.execute(
-                "SELECT workdir FROM sessions WHERE chat_id=?", (chat_id,)
+                "SELECT workdir FROM sessions WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id),
             ).fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:
@@ -325,24 +349,25 @@ def load_workdir(chat_id: int) -> Optional[str]:
         return None
 
 
-def save_paused(chat_id: int, paused: bool):
+def save_paused(chat_id: int, paused: bool, thread_id: int = 0):
     """Пауза чата переживает /clear, /compact и перезапуск скрипта."""
     try:
         with _db() as c:
             c.execute(
-                "INSERT INTO sessions (chat_id, paused, ts) VALUES (?,?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET paused=excluded.paused",
-                (chat_id, 1 if paused else 0, time.time()),
+                "INSERT INTO sessions (chat_id, thread_id, paused, ts) VALUES (?,?,?,?) "
+                "ON CONFLICT(chat_id, thread_id) DO UPDATE SET paused=excluded.paused",
+                (chat_id, thread_id, 1 if paused else 0, time.time()),
             )
     except Exception as e:
         log.error("save_paused: %s", e)
 
 
-def load_paused(chat_id: int) -> bool:
+def load_paused(chat_id: int, thread_id: int = 0) -> bool:
     try:
         with _db() as c:
             row = c.execute(
-                "SELECT paused FROM sessions WHERE chat_id=?", (chat_id,)
+                "SELECT paused FROM sessions WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id),
             ).fetchone()
         return bool(row[0]) if row and row[0] else False
     except Exception as e:
@@ -381,24 +406,25 @@ def resolve_workdir(raw: str) -> Tuple[Optional[str], str]:
     return str(path), ""
 
 
-def save_session(chat_id: int, session_id: str):
+def save_session(chat_id: int, session_id: str, thread_id: int = 0):
     try:
         with _db() as c:
             c.execute(
-                "INSERT INTO sessions (chat_id, session_id, ts) VALUES (?,?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET "
+                "INSERT INTO sessions (chat_id, thread_id, session_id, ts) VALUES (?,?,?,?) "
+                "ON CONFLICT(chat_id, thread_id) DO UPDATE SET "
                 "session_id=excluded.session_id, ts=excluded.ts",
-                (chat_id, session_id, time.time()),
+                (chat_id, thread_id, session_id, time.time()),
             )
     except Exception as e:
         log.error("save_session: %s", e)
 
 
-def load_session(chat_id: int) -> Optional[Tuple[str, float]]:
+def load_session(chat_id: int, thread_id: int = 0) -> Optional[Tuple[str, float]]:
     try:
         with _db() as c:
             row = c.execute(
-                "SELECT session_id, ts FROM sessions WHERE chat_id=?", (chat_id,)
+                "SELECT session_id, ts FROM sessions WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id),
             ).fetchone()
         return (row[0], row[1]) if row and row[0] else None
     except Exception as e:
@@ -406,13 +432,13 @@ def load_session(chat_id: int) -> Optional[Tuple[str, float]]:
         return None
 
 
-def clear_session(chat_id: int):
+def clear_session(chat_id: int, thread_id: int = 0):
     """Забываем сессию, но не выбор модели — он живёт дольше контекста."""
     try:
         with _db() as c:
             c.execute(
-                "UPDATE sessions SET session_id=NULL, ts=? WHERE chat_id=?",
-                (time.time(), chat_id),
+                "UPDATE sessions SET session_id=NULL, ts=? WHERE chat_id=? AND thread_id=?",
+                (time.time(), chat_id, thread_id),
             )
     except Exception as e:
         log.error("clear_session: %s", e)
@@ -469,18 +495,20 @@ def fmt_when(run_at: float) -> str:
 
 
 def add_task(chat_id: int, run_at: float, prompt: str,
-             repeat_secs: float, created_by: Optional[int]) -> Optional[int]:
+             repeat_secs: float, created_by: Optional[int],
+             thread_id: int = 0) -> Optional[int]:
     try:
         with _db() as c:
             n = c.execute(
-                "SELECT COUNT(*) FROM scheduled WHERE chat_id=?", (chat_id,)
+                "SELECT COUNT(*) FROM scheduled WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id),
             ).fetchone()[0]
             if n >= MAX_TASKS_PER_CHAT:
                 return None
             cur = c.execute(
-                "INSERT INTO scheduled (chat_id, run_at, prompt, repeat_secs, created_at, created_by) "
-                "VALUES (?,?,?,?,?,?)",
-                (chat_id, run_at, prompt, repeat_secs, time.time(), created_by),
+                "INSERT INTO scheduled (chat_id, thread_id, run_at, prompt, repeat_secs, created_at, created_by) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (chat_id, thread_id, run_at, prompt, repeat_secs, time.time(), created_by),
             )
             return cur.lastrowid
     except Exception as e:
@@ -488,25 +516,26 @@ def add_task(chat_id: int, run_at: float, prompt: str,
         return None
 
 
-def list_tasks(chat_id: int) -> List[Tuple]:
+def list_tasks(chat_id: int, thread_id: int = 0) -> List[Tuple]:
     try:
         with _db() as c:
             return c.execute(
                 "SELECT id, run_at, prompt, repeat_secs FROM scheduled "
-                "WHERE chat_id=? ORDER BY run_at",
-                (chat_id,),
+                "WHERE chat_id=? AND thread_id=? ORDER BY run_at",
+                (chat_id, thread_id),
             ).fetchall()
     except Exception as e:
         log.error("list_tasks: %s", e)
         return []
 
 
-def cancel_task(chat_id: int, task_id: int) -> bool:
-    """Удаляет задачу только в пределах своего чата (чужую не тронуть)."""
+def cancel_task(chat_id: int, task_id: int, thread_id: int = 0) -> bool:
+    """Удаляет задачу только в пределах своего чата/топика (чужую не тронуть)."""
     try:
         with _db() as c:
             cur = c.execute(
-                "DELETE FROM scheduled WHERE id=? AND chat_id=?", (task_id, chat_id)
+                "DELETE FROM scheduled WHERE id=? AND chat_id=? AND thread_id=?",
+                (task_id, chat_id, thread_id),
             )
             return cur.rowcount > 0
     except Exception as e:
@@ -518,7 +547,7 @@ def due_tasks(now: float) -> List[Tuple]:
     try:
         with _db() as c:
             return c.execute(
-                "SELECT id, chat_id, run_at, prompt, repeat_secs FROM scheduled "
+                "SELECT id, chat_id, thread_id, run_at, prompt, repeat_secs FROM scheduled "
                 "WHERE run_at<=? ORDER BY run_at",
                 (now,),
             ).fetchall()
@@ -545,6 +574,44 @@ def _settle_task(task_id: int, run_at: float, repeat_secs: float, now: float):
 
 
 # --------------------------------------------------------------------------
+# Маркер занятости для безопасного рестарта
+# --------------------------------------------------------------------------
+# Пока идёт ход (генерация + дострим финального текста в Telegram), мост держит
+# файл-маркер со свежим таймстампом. restart_bridge.ps1 ждёт, пока маркер
+# исчезнет (или протухнет), и только потом убивает процесс — иначе жёсткий
+# Stop-Process посреди дописывания обрубает длинное сообщение на полуслове.
+BUSY_FILE = pathlib.Path(os.environ.get("BUSY_FILE", "bridge.busy"))
+_busy_count = 0
+
+
+def _busy_touch():
+    try:
+        BUSY_FILE.write_text(str(time.time()))
+    except Exception:
+        pass
+
+
+def _busy_enter():
+    global _busy_count
+    _busy_count += 1
+    _busy_touch()
+
+
+def _busy_exit():
+    global _busy_count
+    _busy_count = max(0, _busy_count - 1)
+    if _busy_count == 0:
+        try:
+            BUSY_FILE.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    else:
+        _busy_touch()
+
+
+# --------------------------------------------------------------------------
 # Тонкий клиент Telegram (long polling — белый IP не нужен)
 # --------------------------------------------------------------------------
 
@@ -562,6 +629,18 @@ def _normalize_md(text: str) -> str:
     text = _BOLD_DBL_RE.sub(r"*\1*", text)
     text = _BOLD_UNDERSCORE_RE.sub(r"*\1*", text)
     return text
+
+
+_RETRY_AFTER_RE = re.compile(r"retry_after['\"]?\s*[:=]\s*(\d+)")
+
+
+def _retry_after(err: str, fallback: float) -> float:
+    """Telegram в теле ошибки 429 отдаёт parameters.retry_after — сколько
+    секунд ждать. Уважаем его (с запасом), иначе откатываемся на свой интервал."""
+    m = _RETRY_AFTER_RE.search(err)
+    if m:
+        return min(float(m.group(1)) + 0.5, 15.0)
+    return fallback
 
 
 class Telegram:
@@ -590,7 +669,9 @@ class Telegram:
                 return await self.call(method, **params)
             raise
 
-    async def send(self, chat_id: int, text: str, reply_to: Optional[int] = None):
+    async def send(self, chat_id: int, text: str, reply_to: Optional[int] = None,
+                   thread_id: int = 0):
+        extra = {"message_thread_id": thread_id} if thread_id else {}
         for chunk in _split(text, TG_MSG_LIMIT):
             try:
                 await self.call_md(
@@ -599,14 +680,16 @@ class Telegram:
                     text=chunk,
                     reply_to_message_id=reply_to,
                     allow_sending_without_reply=True,
+                    **extra,
                 )
             except Exception as e:
                 log.error("sendMessage: %s", e)
             reply_to = None
 
-    async def typing(self, chat_id: int):
+    async def typing(self, chat_id: int, thread_id: int = 0):
+        extra = {"message_thread_id": thread_id} if thread_id else {}
         try:
-            await self.call("sendChatAction", chat_id=chat_id, action="typing")
+            await self.call("sendChatAction", chat_id=chat_id, action="typing", **extra)
         except Exception:
             pass
 
@@ -685,7 +768,7 @@ class Telegram:
                 await asyncio.sleep(min(0.5 * (i + 1), 3.0))
         raise RuntimeError(f"still locked/unreadable after retries: {last}")
 
-    async def send_file(self, chat_id: int, path: pathlib.Path):
+    async def send_file(self, chat_id: int, path: pathlib.Path, thread_id: int = 0):
         """Отправляет локальный файл: картинки — как sendPhoto, остальное — sendDocument."""
         payload = await self._read_file_bytes(path)
         is_image = path.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp")
@@ -693,12 +776,38 @@ class Telegram:
         url = TG_API.format(token=self.token, method=method)
         data = aiohttp.FormData()
         data.add_field("chat_id", str(chat_id))
+        if thread_id:
+            data.add_field("message_thread_id", str(thread_id))
         data.add_field(field, payload, filename=path.name)
         timeout = aiohttp.ClientTimeout(total=120)
         async with self.session.post(url, data=data, timeout=timeout) as resp:
             result = await resp.json()
         if not result.get("ok"):
             raise RuntimeError(f"{method} failed: {result}")
+
+
+class _TopicTG:
+    """Тонкая обёртка над Telegram, подставляющая message_thread_id во все
+    исходящие текстовые сообщения/индикаторы/файлы. Нужна, чтобы ответы в
+    форумной супергруппе уходили в тот же топик, откуда пришёл вопрос, без
+    правки каждого места отправки. Остальные методы (call, download_file, …)
+    проксируются как есть."""
+
+    def __init__(self, tg: "Telegram", thread_id: int):
+        self._tg = tg
+        self._thread = thread_id
+
+    async def send(self, chat_id: int, text: str, reply_to: Optional[int] = None):
+        await self._tg.send(chat_id, text, reply_to=reply_to, thread_id=self._thread)
+
+    async def typing(self, chat_id: int):
+        await self._tg.typing(chat_id, thread_id=self._thread)
+
+    async def send_file(self, chat_id: int, path: pathlib.Path):
+        await self._tg.send_file(chat_id, path, thread_id=self._thread)
+
+    def __getattr__(self, name):
+        return getattr(self._tg, name)
 
 
 def _split(text: str, limit: int) -> List[str]:
@@ -786,9 +895,10 @@ class StreamingMessage:
     поэтому done_len хранит, сколько символов уже ушло в закрытые.
     """
 
-    def __init__(self, tg: "Telegram", chat_id: int, workdir: str = "."):
+    def __init__(self, tg: "Telegram", chat_id: int, workdir: str = ".", thread_id: int = 0):
         self.tg = tg
         self.chat_id = chat_id
+        self.thread_id = thread_id
         self.workdir = workdir
         self.message_id: Optional[int] = None
         self.buf = ""        # текст текущего сообщения (сырой, с метками)
@@ -829,13 +939,13 @@ class StreamingMessage:
 
     async def _deliver(self, p: pathlib.Path):
         try:
-            await self.tg.send_file(self.chat_id, p)
+            await self.tg.send_file(self.chat_id, p, thread_id=self.thread_id)
         except SkipSend:
             log.info("[%s] send-маркер без реального файла, пропускаю: %s", self.chat_id, p)
         except Exception as e:
             log.error("[%s] send_file %s: %s", self.chat_id, p, e)
             try:
-                await self.tg.send(self.chat_id, sys_text(f"Couldn't send {p.name}: {e}"))
+                await self.tg.send(self.chat_id, sys_text(f"Couldn't send {p.name}: {e}"), thread_id=self.thread_id)
             except Exception:
                 pass
 
@@ -867,7 +977,7 @@ class StreamingMessage:
         except asyncio.CancelledError:
             return
 
-    async def _render(self, final: bool = False):
+    async def _render(self, final: bool = False) -> bool:
         # Сначала вырезаем дописанные метки [[send:]] и отправляем файлы —
         # в тексте они мелькать не должны.
         self._harvest_sends()
@@ -878,15 +988,16 @@ class StreamingMessage:
         body = self._display_buf()
         target = f"{body}\n\n{self.status}" if self.status else body
         if not target:
-            return
+            return True
 
         # Текущее сообщение переросло лимит — закрываем его и начинаем новое.
+        ok = True
         while len(self.buf) > SPLIT_AT:
             cut = self.buf.rfind("\n", 0, SPLIT_AT)
             if cut < SPLIT_AT // 2:
                 cut = SPLIT_AT
             head, self.buf = self.buf[:cut], self.buf[cut:].lstrip("\n")
-            await self._push(head, close=True)
+            ok = await self._push(head, close=True, insist=final) and ok
             self.done_len += len(head)
             self.message_id = None
             self.shown = ""
@@ -894,36 +1005,56 @@ class StreamingMessage:
             target = f"{body}\n\n{self.status}" if self.status else body
 
         if target != self.shown:
-            await self._push(target)
+            ok = await self._push(target, insist=final) and ok
+        return ok
 
-    async def _push(self, text: str, close: bool = False):
+    async def _push(self, text: str, close: bool = False, insist: bool = False) -> bool:
+        """Отправляет/правит текущее сообщение. Возвращает True, если текст
+        доставлен (или доставлять нечего). insist=True упорствует при 429:
+        под конец хода правки часто упираются в лимит, а финальный рендер
+        всего один — без ретрая концовка не доедет и сообщение застынет на
+        промежуточной версии."""
         text = text.strip()
         if not text:
-            return
-        try:
-            if self.message_id is None:
-                res = await self.tg.call_md(
-                    "sendMessage", chat_id=self.chat_id, text=text
-                )
-                self.message_id = res["message_id"]
-            else:
-                await self.tg.call_md(
-                    "editMessageText",
-                    chat_id=self.chat_id,
-                    message_id=self.message_id,
-                    text=text,
-                )
-            self.shown = "" if close else text
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "Too Many Requests" in msg:
-                # Притормаживаем: лимит правок на чат.
-                self._interval = min(self._interval * 1.5, 5.0)
-                log.debug("[%s] rate limit, интервал -> %.1f", self.chat_id, self._interval)
-            elif "not modified" in msg:
-                self.shown = text
-            else:
-                log.debug("[%s] push: %s", self.chat_id, msg)
+            return True
+        attempts = 12 if insist else 1
+        for i in range(attempts):
+            try:
+                if self.message_id is None:
+                    extra = {"message_thread_id": self.thread_id} if self.thread_id else {}
+                    res = await self.tg.call_md(
+                        "sendMessage", chat_id=self.chat_id, text=text, **extra
+                    )
+                    self.message_id = res["message_id"]
+                else:
+                    await self.tg.call_md(
+                        "editMessageText",
+                        chat_id=self.chat_id,
+                        message_id=self.message_id,
+                        text=text,
+                    )
+                self.shown = "" if close else text
+                _busy_touch()   # жив и пишем — держим маркер занятости свежим
+                return True
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "Too Many Requests" in msg:
+                    # Притормаживаем: лимит правок на чат.
+                    self._interval = min(self._interval * 1.5, 5.0)
+                    log.debug("[%s] rate limit, интервал -> %.1f", self.chat_id, self._interval)
+                    if insist and i < attempts - 1:
+                        await asyncio.sleep(_retry_after(msg, self._interval))
+                        continue
+                    return False
+                elif "not modified" in msg:
+                    self.shown = text
+                    return True
+                else:
+                    # Непредвиденная ошибка правки. Не выдаём за успех — вернём
+                    # провал, чтобы finish() досыл хвоста отдельным сообщением.
+                    log.warning("[%s] push failed: %s", self.chat_id, msg)
+                    return False
+        return False
 
     async def finish(self, final_text: Optional[str]):
         """Дорисовывает окончательный текст из события result."""
@@ -936,10 +1067,29 @@ class StreamingMessage:
         if final_text and final_text.strip():
             self.buf = final_text[self.done_len:] if self.done_len else final_text
 
+        ok = False
         try:
-            await self._render(final=True)
+            ok = await self._render(final=True)
         except Exception as e:
             log.error("[%s] finish: %s", self.chat_id, e)
+
+        # Гарантия доставки концовки: если финальную правку Telegram так и не
+        # принял (429 исчерпал ретраи или иная ошибка), текущее сообщение застыло
+        # на промежуточной укороченной версии. Досылаем недоставленный хвост
+        # отдельным сообщением — так концовка не теряется при любой причине.
+        if not ok:
+            full = self._display_buf()
+            tail = full[len(self.shown):] if self.shown and full.startswith(self.shown) else full
+            tail = tail.strip()
+            if tail:
+                log.warning(
+                    "[%s] финальная правка не прошла — досылаю хвост (%d симв.) отдельным сообщением",
+                    self.chat_id, len(tail),
+                )
+                try:
+                    await self.tg.send(self.chat_id, tail, thread_id=self.thread_id)
+                except Exception as e:
+                    log.error("[%s] finish tail send: %s", self.chat_id, e)
 
     async def abort(self):
         self._closed = True
@@ -948,19 +1098,22 @@ class StreamingMessage:
 
 
 class ChatActor:
-    def __init__(self, chat_id: int, tg: Telegram, sem: asyncio.Semaphore):
+    def __init__(self, chat_id: int, tg: Telegram, sem: asyncio.Semaphore, thread_id: int = 0):
         self.chat_id = chat_id
+        # thread_id топика форумной супергруппы (0 — обычный чат/General). Свой
+        # процесс, сессия и настройки на каждый (chat_id, thread_id).
+        self.thread_id = thread_id
         self.tg = tg
         self.sem = sem
 
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.session_id: Optional[str] = None
         self.resumed = False
-        self.model: str = load_model(chat_id) or DEFAULT_MODEL
-        self.system_prompt: Optional[str] = load_system_prompt(chat_id)
-        self.workdir: str = load_workdir(chat_id) or CLAUDE_WORKDIR
+        self.model: str = load_model(chat_id, thread_id) or DEFAULT_MODEL
+        self.system_prompt: Optional[str] = load_system_prompt(chat_id, thread_id)
+        self.workdir: str = load_workdir(chat_id, thread_id) or CLAUDE_WORKDIR
         # Пауза: бот не реагирует на обычные сообщения этого чата, пока /resume.
-        self.paused: bool = load_paused(chat_id)
+        self.paused: bool = load_paused(chat_id, thread_id)
 
         # Режим «следующее сообщение — это системный промпт».
         self.awaiting_system: float = 0.0
@@ -1062,6 +1215,7 @@ class ChatActor:
                     await self.tg.send(
                         self.chat_id,
                         sys_text(f"⚠️ Session crashed: {e}\nNext message will start a fresh one."),
+                        thread_id=self.thread_id,
                     )
                     break
         # Ход оставил висящую фоновую задачу — слушаем её автономный ответ.
@@ -1119,7 +1273,7 @@ class ChatActor:
         delivered = 0
         try:
             while self.alive() and not self._preempt and time.monotonic() < self._bg_deadline:
-                stream = StreamingMessage(self.tg, self.chat_id, self.workdir) if STREAMING else None
+                stream = StreamingMessage(self.tg, self.chat_id, self.workdir, self.thread_id) if STREAMING else None
                 if stream:
                     stream.start()
                 self._tail_state = "idle"
@@ -1141,7 +1295,11 @@ class ChatActor:
                     return
                 # Полный сегмент получили — отдаём его целиком (даже если тем
                 # временем пришёл _preempt: терять готовый ответ нельзя).
-                await self._deliver_segment(answer, stream)
+                _busy_enter()
+                try:
+                    await self._deliver_segment(answer, stream)
+                finally:
+                    _busy_exit()
                 delivered += 1
                 self.last_activity = time.monotonic()
                 log.info("[%s] tail-reader: автономный ответ доставлен (#%d)", self.chat_id, delivered)
@@ -1174,7 +1332,7 @@ class ChatActor:
 
         self.resumed = False
         if not self._force_fresh:
-            row = load_session(self.chat_id)
+            row = load_session(self.chat_id, self.thread_id)
             if row and (time.time() - row[1]) < RESUME_MAX_AGE_S:
                 cmd += ["--resume", row[0]]
                 self.resumed = True
@@ -1235,7 +1393,7 @@ class ChatActor:
     async def reset(self):
         """Полный сброс контекста: процесс убит, привязка к сессии стёрта."""
         await self.kill()
-        clear_session(self.chat_id)
+        clear_session(self.chat_id, self.thread_id)
         self.session_id = None
         self.context_tokens = 0
         self._last_msg_usage = {}
@@ -1254,7 +1412,7 @@ class ChatActor:
         Поэтому применяется только при следующем спавне — гасим процесс.
         """
         self.system_prompt = (prompt or "").strip() or None
-        save_system_prompt(self.chat_id, self.system_prompt)
+        save_system_prompt(self.chat_id, self.system_prompt, self.thread_id)
         self.awaiting_system = 0.0
 
         was_live = self.alive()
@@ -1268,7 +1426,7 @@ class ChatActor:
     async def set_model(self, model: str) -> str:
         """Смена модели требует рестарта процесса — контекст теряется."""
         old, self.model = self.model, model
-        save_model(self.chat_id, model)
+        save_model(self.chat_id, model, self.thread_id)
         had_context = self.alive() or bool(self.session_id)
         await self.reset()
         self.model = model  # reset не трогает модель, но перестрахуемся
@@ -1291,7 +1449,7 @@ class ChatActor:
         had_context = self.alive() or bool(self.session_id)
         await self.reset()
         self.workdir = path
-        save_workdir(self.chat_id, path)
+        save_workdir(self.chat_id, path, self.thread_id)
 
         note = "\nContext reset — sessions are tied to the working directory." if had_context else ""
         return f"Directory: {old} → {path}{note}"
@@ -1322,7 +1480,7 @@ class ChatActor:
             return "Couldn't compact context — session didn't respond. Try /clear."
 
         await self.kill()
-        clear_session(self.chat_id)
+        clear_session(self.chat_id, self.thread_id)
         self.session_id = None
         self.context_tokens = 0
         self._last_msg_usage = {}
@@ -1344,12 +1502,16 @@ class ChatActor:
             await self.tg.send(
                 self.chat_id,
                 sys_text("⏸ Session disabled after repeated crashes. Check the logs and that `claude` is authenticated."),
+                thread_id=self.thread_id,
             )
             return
 
         self._interrupt = False
-        stream = StreamingMessage(self.tg, self.chat_id, self.workdir) if STREAMING else None
+        stream = StreamingMessage(self.tg, self.chat_id, self.workdir, self.thread_id) if STREAMING else None
 
+        # Пока идёт ход и дострим финального текста — держим маркер занятости,
+        # чтобы рестарт не убил процесс посреди дописывания сообщения.
+        _busy_enter()
         try:
             async with self.sem:
                 answer = await self._turn_once(text, stream)
@@ -1359,27 +1521,28 @@ class ChatActor:
                     log.warning("[%s] resume не поднялся, стартую чисто", self.chat_id)
                     if stream:
                         await stream.abort()
-                        stream = StreamingMessage(self.tg, self.chat_id, self.workdir)
-                    clear_session(self.chat_id)
+                        stream = StreamingMessage(self.tg, self.chat_id, self.workdir, self.thread_id)
+                    clear_session(self.chat_id, self.thread_id)
                     self._force_fresh = True
                     await self.kill()
                     answer = await self._turn_once(text, stream)
                     if answer is None:
                         raise RuntimeError("процесс claude не стартует")
+            self._crashes = 0
+            self.last_activity = time.monotonic()
+
+            await self._deliver_segment(answer, stream)
+            await self._maybe_warn_context()
         except Interrupted:
             # Оставляем уже показанный кусок ответа и уже отправленные файлы.
             if stream:
                 await stream.finish(None)
             self._interrupt = False
             self.last_activity = time.monotonic()
-            await self.tg.send(self.chat_id, sys_text("⏹ Stopped. Next message continues the session."))
+            await self.tg.send(self.chat_id, sys_text("⏹ Stopped. Next message continues the session."), thread_id=self.thread_id)
             return
-
-        self._crashes = 0
-        self.last_activity = time.monotonic()
-
-        await self._deliver_segment(answer, stream)
-        await self._maybe_warn_context()
+        finally:
+            _busy_exit()
 
     async def _deliver_segment(self, answer: str, stream: Optional["StreamingMessage"]):
         """Отдаёт готовый сегмент (ответ хода) в чат: финализирует стрим-сообщение
@@ -1395,18 +1558,18 @@ class ChatActor:
                 await stream.abort()
             # Пустой текст при наличии файла не гоним — это был чистый [[send:]].
             if answer or not files_to_send:
-                await self.tg.send(self.chat_id, answer)
+                await self.tg.send(self.chat_id, answer, thread_id=self.thread_id)
 
         for path in files_to_send:
             if str(path) in already:      # уже ушёл по ходу стриминга
                 continue
             try:
-                await self.tg.send_file(self.chat_id, path)
+                await self.tg.send_file(self.chat_id, path, thread_id=self.thread_id)
             except SkipSend:
                 log.info("[%s] send-маркер без реального файла, пропускаю: %s", self.chat_id, path)
             except Exception as e:
                 log.error("[%s] send_file %s: %s", self.chat_id, path, e)
-                await self.tg.send(self.chat_id, sys_text(f"Couldn't send {path.name}: {e}"))
+                await self.tg.send(self.chat_id, sys_text(f"Couldn't send {path.name}: {e}"), thread_id=self.thread_id)
 
     async def _turn_once(self, text: str, stream: Optional["StreamingMessage"] = None) -> Optional[str]:
         """Один ход. None = сессия не поднялась (кандидат на протухший resume)."""
@@ -1442,7 +1605,8 @@ class ChatActor:
             await self.kill()
             self._note_crash()
             await self.tg.send(
-                self.chat_id, sys_text("⏱ Turn didn't finish in time. Session restarted.")
+                self.chat_id, sys_text("⏱ Turn didn't finish in time. Session restarted."),
+                thread_id=self.thread_id,
             )
             return "(timeout)"
         finally:
@@ -1452,7 +1616,7 @@ class ChatActor:
     async def _typing_loop(self):
         try:
             while True:
-                await self.tg.typing(self.chat_id)
+                await self.tg.typing(self.chat_id, thread_id=self.thread_id)
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             return
@@ -1522,7 +1686,7 @@ class ChatActor:
                     self.session_id = sid
                     # Пишем сразу, до первого ответа: краш посреди хода
                     # не должен терять привязку чата к сессии.
-                    save_session(self.chat_id, sid)
+                    save_session(self.chat_id, sid, self.thread_id)
                 log.info("[%s] session %s", self.chat_id, self.session_id)
 
             elif etype == "assistant":
@@ -1620,6 +1784,7 @@ class ChatActor:
                     f"({_fmt_tokens(self.context_tokens)} / {_fmt_tokens(CONTEXT_WINDOW)}). "
                     f"There's no auto-compaction here — the turn will fail on overflow. /clear starts over."
                 ),
+                thread_id=self.thread_id,
             )
 
     def context_report(self) -> str:
@@ -1663,12 +1828,13 @@ class Supervisor:
     def __init__(self, tg: Telegram):
         self.tg = tg
         self.sem = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
-        self.actors: Dict[int, ChatActor] = {}
+        self.actors: Dict[Tuple[int, int], ChatActor] = {}
 
-    def actor(self, chat_id: int) -> ChatActor:
-        if chat_id not in self.actors:
-            self.actors[chat_id] = ChatActor(chat_id, self.tg, self.sem)
-        return self.actors[chat_id]
+    def actor(self, chat_id: int, thread_id: int = 0) -> ChatActor:
+        key = (chat_id, thread_id)
+        if key not in self.actors:
+            self.actors[key] = ChatActor(chat_id, self.tg, self.sem, thread_id)
+        return self.actors[key]
 
     async def reaper(self):
         """Гасит процессы, простоявшие дольше IDLE_TIMEOUT_S."""
@@ -1688,18 +1854,19 @@ class Supervisor:
         while True:
             await asyncio.sleep(SCHEDULER_TICK_S)
             now = time.time()
-            for task_id, chat_id, run_at, prompt, repeat_secs in due_tasks(now):
+            for task_id, chat_id, thread_id, run_at, prompt, repeat_secs in due_tasks(now):
                 # Сначала фиксируем (удаляем/двигаем), потом отправляем — так
                 # перезапуск моста в момент выстрела не продублирует задачу.
                 _settle_task(task_id, run_at, repeat_secs, now)
                 try:
-                    actor = self.actor(chat_id)
+                    actor = self.actor(chat_id, thread_id)
                     fire = (
                         f"⏰ Запланированная задача #{task_id} — время выполнить её сейчас:\n"
                         f"{prompt}"
                     )
                     await self.tg.send(
-                        chat_id, sys_text(f"⏰ Запускаю задачу #{task_id}…")
+                        chat_id, sys_text(f"⏰ Запускаю задачу #{task_id}…"),
+                        thread_id=thread_id,
                     )
                     await actor.submit(fire)
                     log.info("[%s] задача #%s сработала", chat_id, task_id)
@@ -1777,6 +1944,13 @@ def _should_notify_denial(chat_id: int, user_id: Optional[int]) -> bool:
 
 async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     chat_id = msg["chat"]["id"]
+    # Топик форумной супергруппы: каждый топик — отдельный контекст/сессия. Берём
+    # thread_id только у настоящих топиков (is_topic_message), иначе 0 — обычный
+    # чат или General. Все ответы этого хода уводим в тот же топик через обёртку.
+    thread_id = msg.get("message_thread_id") if msg.get("is_topic_message") else None
+    thread_id = thread_id or 0
+    if thread_id:
+        tg = _TopicTG(tg, thread_id)
     attachment = _incoming_attachment(msg)
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if not text and not attachment:
@@ -1799,8 +1973,8 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
     # Пауза: чат полностью заглушён — молчим на всё, включая отказы чужим (иначе
     # пауза не «не отвлекает»). Пропускаем только команды от своих, чтобы /resume
     # и настройки работали. Состояние читаем без поднятия процесса.
-    existing = sup.actors.get(chat_id)
-    paused = existing.paused if existing else load_paused(chat_id)
+    existing = sup.actors.get((chat_id, thread_id))
+    paused = existing.paused if existing else load_paused(chat_id, thread_id)
     if paused and not (privileged and text.startswith("/")):
         return
 
@@ -1820,7 +1994,7 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
             )
         return
 
-    actor = sup.actor(chat_id)
+    actor = sup.actor(chat_id, thread_id)
 
     if attachment:
         file_id, filename = attachment
@@ -1862,7 +2036,8 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
 
         if cmd in ("/start", "/help"):
             uid = (msg.get("from") or {}).get("id")
-            await tg.send(chat_id, sys_text(f"Ready. chat_id: {chat_id}, user_id: {uid}\n\n{HELP}"))
+            topic = f", topic: {thread_id}" if thread_id else ""
+            await tg.send(chat_id, sys_text(f"Ready. chat_id: {chat_id}{topic}, user_id: {uid}\n\n{HELP}"))
             return
 
         if cmd in ("/stop", "/cancel", "/interrupt"):
@@ -1913,7 +2088,7 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
                 if cmd == "/every":
                     repeat = secs
             uid = (msg.get("from") or {}).get("id")
-            tid = add_task(chat_id, run_at, prompt, repeat, uid)
+            tid = add_task(chat_id, run_at, prompt, repeat, uid, thread_id)
             if tid is None:
                 await tg.send(chat_id, sys_text(f"Too many scheduled tasks (limit {MAX_TASKS_PER_CHAT}). Remove some with /tasks del <id>."))
                 return
@@ -1929,10 +2104,10 @@ async def handle(sup: Supervisor, tg: Telegram, msg: dict):
                 except ValueError:
                     await tg.send(chat_id, sys_text("Usage: /tasks del <id>"))
                     return
-                ok = cancel_task(chat_id, tid)
+                ok = cancel_task(chat_id, tid, thread_id)
                 await tg.send(chat_id, sys_text(f"Task #{tid} removed." if ok else f"No task #{tid} in this chat."))
                 return
-            rows = list_tasks(chat_id)
+            rows = list_tasks(chat_id, thread_id)
             if not rows:
                 await tg.send(chat_id, sys_text("No scheduled tasks.\n\n" + SCHED_USAGE))
                 return

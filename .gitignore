@@ -15,6 +15,7 @@ env/
 
 # Runtime logs and local launch/restart helpers (machine-specific abs paths)
 *.log
+bridge.busy
 restart_bridge.ps1
 start_bridge.bat
 
